@@ -29,8 +29,8 @@
 
 namespace amd {
 
-HostThread::HostThread() : Thread("HostThread", 0, false) {
-  setCurrent();
+HostThread::HostThread(bool passOwnership) : Thread("HostThread", 0, false) {
+  setCurrent(passOwnership);
   Os::currentStackInfo(&stackBase_, &stackSize_);
   setState(RUNNABLE);
 }
@@ -121,7 +121,8 @@ void Thread::resume() {
 
 namespace details {
 
-__thread Thread* thread_ __attribute__((tls_model("initial-exec")));
+thread_local std::unique_ptr<Thread> thread_;
+thread_local Thread* mthread_ = nullptr;
 
 }  // namespace details
 
@@ -129,7 +130,13 @@ void Thread::registerStack(address base, address top) {
   // Nothing to do.
 }
 
-void Thread::setCurrent() { details::thread_ = this; }
+void Thread::setCurrent(bool passOwnership) {
+  if (passOwnership) {
+    details::thread_.reset(this);
+   } else {
+    details::mthread_ = this;
+  }
+}
 
 #elif defined(_WIN32)
 
@@ -147,7 +154,7 @@ void Thread::registerStack(address base, address top) {
   // Nothing to do.
 }
 
-void Thread::setCurrent() {
+void Thread::setCurrent(bool passOwnership) {
 #if defined(USE_DECLSPEC_THREAD)
   details::thread_ = this;
 #else   // !USE_DECLSPEC_THREAD

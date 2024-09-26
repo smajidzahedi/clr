@@ -188,7 +188,7 @@ bool HsaAmdSignalHandler(hsa_signal_value_t value, void* arg) {
 
   amd::Thread* thread = amd::Thread::current();
   if (!(thread != nullptr ||
-      ((thread = new amd::HostThread()) != nullptr && thread == amd::Thread::current()))) {
+      ((thread = new amd::HostThread(true)) != nullptr && thread == amd::Thread::current()))) {
     return false;
   }
 

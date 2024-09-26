@@ -26,6 +26,7 @@
 #include "os/os.hpp"
 
 #include <string>
+#include <memory>
 
 #if defined(_WIN32)
 #define USE_DECLSPEC_THREAD 1
@@ -95,7 +96,7 @@ class Thread : public HeapObject {
   void setState(ThreadState state) { state_ = state; }
 
   //! Set the thread-local _thread variable (used by current()).
-  void setCurrent();
+  void setCurrent(bool passOwnership = false);
 
   //! Register the given memory region as a valid stack.
   void registerStack(address base, address top);
@@ -172,7 +173,7 @@ class HostThread : public Thread {
 
  public:
   //! Construct a new HostThread
-  HostThread();
+  HostThread(bool passOwnership = false);
 
   //! Return true is this is the host thread.
   bool isHostThread() const { return true; };
@@ -186,9 +187,10 @@ namespace details {
 
 #if defined(__linux__)
 
-extern __thread Thread* thread_ __attribute__((tls_model("initial-exec")));
+extern thread_local std::unique_ptr<Thread> thread_;
+extern thread_local Thread* mthread_;
 
-static inline Thread* currentThread() { return thread_; }
+static inline Thread* currentThread() { return mthread_ ? mthread_ : thread_.get(); }
 
 #elif defined(_WIN32)
 

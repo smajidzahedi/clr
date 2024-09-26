@@ -77,7 +77,7 @@ not_null(T* ptrOrNull)
 }
 
 #define VDI_CHECK_THREAD(thread)                                             \
-    (thread != NULL || ((thread = new amd::HostThread()) != NULL             \
+    (thread != NULL || ((thread = new amd::HostThread(true)) != NULL             \
             && thread == amd::Thread::current()))
 
 #define RUNTIME_ENTRY_RET(ret, func, args)                                   \
