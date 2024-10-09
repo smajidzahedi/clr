@@ -484,3 +484,8 @@ hipGraphAddBatchMemOpNode
 hipGraphBatchMemOpNodeGetParams
 hipGraphBatchMemOpNodeSetParams
 hipGraphExecBatchMemOpNodeSetParams
+hipLinkAddData
+hipLinkAddFile
+hipLinkComplete
+hipLinkCreate
+hipLinkDestroy
