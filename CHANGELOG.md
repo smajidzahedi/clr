@@ -8,6 +8,11 @@ Full documentation for HIP is available at [rocm.docs.amd.com](https://rocm.docs
 * Added new environment variable
     - `DEBUG_HIP_7_PREVIEW` This is used for enabling the backward incompatible changes before the next major ROCm release 7.0. By default this is set to 0. Users can set this variable to 0x1, to match the behavior of hipGetLastError with its corresponding CUDA API.
 
+- The `_sync()` version of crosslane builtins such as `shfl_sync()`,
+  `__all_sync()` and `__any_sync()`, continue to be hidden behind the
+  preprocessor macro `HIP_ENABLE_WARP_SYNC_BUILTINS`, and will be enabled
+  unconditionally in a future ROCm release.
+
 ## HIP 6.3 for ROCm 6.3
 
 ### Changed
