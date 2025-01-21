@@ -383,7 +383,7 @@ inline void Os::ThreadAffinityMask::clear(uint cpu) { CPU_CLR(cpu, &mask_); }
 inline bool Os::ThreadAffinityMask::isSet(uint cpu) const { return CPU_ISSET(cpu, &mask_); }
 
 inline bool Os::ThreadAffinityMask::isEmpty() const {
-  for (auto bits : mask_.__bits) {
+  for (__cpu_mask bits : mask_.__bits) {
     if (bits != 0) {
       return false;
     }
@@ -407,7 +407,7 @@ inline void Os::ThreadAffinityMask::adjust(cpu_set_t& mask) const {
 
 inline uint Os::ThreadAffinityMask::countSet() const {
   uint count = 0;
-  for (auto bits : mask_.__bits) {
+  for (__cpu_mask bits : mask_.__bits) {
     count += countBitsSet(bits);
   }
   return count;
@@ -415,9 +415,9 @@ inline uint Os::ThreadAffinityMask::countSet() const {
 
 inline uint Os::ThreadAffinityMask::getFirstSet() const {
   uint i = 0;
-  for (auto bits : mask_.__bits) {
+  for (__cpu_mask bits : mask_.__bits) {
     if (bits != 0) {
-      return leastBitSet(bits) + (i * (8 * sizeof(bits)));
+      return leastBitSet(bits) + (i * (8 * sizeof(__cpu_mask)));
     }
 
     ++i;
