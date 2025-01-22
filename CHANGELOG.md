@@ -7,6 +7,9 @@ Full documentation for HIP is available at [rocm.docs.amd.com](https://rocm.docs
 ### Changed
 * Added new environment variable
     - `DEBUG_HIP_7_PREVIEW` This is used for enabling the backward incompatible changes before the next major ROCm release 7.0. By default this is set to 0. Users can set this variable to 0x1, to match the behavior of hipGetLastError with its corresponding CUDA API.
+* roc-obj* tools are being deprecated, and will be removed in an upcoming release.
+    - Perl package dependencies are now RECOMENDS or SUGGESTS.  Users will need to install these themselves.
+    - Support for ROCm Object tooling has moved into llvm-objdump provided by package rocm-llvm.
 
 - The `_sync()` version of crosslane builtins such as `shfl_sync()`,
   `__all_sync()` and `__any_sync()`, continue to be hidden behind the
