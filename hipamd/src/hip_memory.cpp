@@ -26,6 +26,8 @@
 #include "platform/command.hpp"
 #include "platform/memory.hpp"
 #include "platform/external_memory.hpp"
+#include "hip_mrfs.hpp"
+
 namespace hip {
 
 amd::Monitor hipArraySetLock{"Guards global hipArray set"};
@@ -1564,7 +1566,9 @@ hipError_t hipMemcpyAsync_common(void* dst, const void* src, size_t sizeBytes,
   if (!hip::isValid(stream)) {
     return hipErrorContextIsDestroyed;
   }
-  return ihipMemcpy(dst, src, sizeBytes, kind, *hip_stream, true);
+  
+  return hipMemcpyAsync_mrfs(dst, src, sizeBytes, kind, *hip_stream);
+  // return ihipMemcpy(dst, src, sizeBytes, kind, *hip_stream, true);
 }
 
 hipError_t hipMemcpyAsync(void* dst, const void* src, size_t sizeBytes,
