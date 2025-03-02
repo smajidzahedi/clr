@@ -121,6 +121,7 @@ target_sources(amdhip64 PRIVATE
   hip_mempool.cpp
   hip_mempool_impl.cpp
   hip_module.cpp
+  hip_mrfs.cpp
   hip_peer.cpp
   hip_platform.cpp
   hip_profile.cpp

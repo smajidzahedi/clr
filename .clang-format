@@ -1,5 +1,6 @@
 Language: Cpp
 BasedOnStyle: Google
+AccessModifierOffset: 0
 AlignEscapedNewlinesLeft: false
 AlignOperands: false
 ColumnLimit: 100
