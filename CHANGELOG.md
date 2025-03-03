@@ -4,25 +4,125 @@ Full documentation for HIP is available at [rocm.docs.amd.com](https://rocm.docs
 
 ## HIP 6.4 (For ROCm 6.4)
 
+### Added
+
+* New HIP APIs
+    - `hipDeviceGetTexture1DLinearMaxWidth`  returns the maximum width of elements in a 1D linear texture, that can be allocated on the specified device.
+    - `hipStreamBatchMemOp`  enqueues an array of batch memory operations in the stream, for stream synchronization.
+    - `hipGraphAddBatchMemOpNode`  creates a batch memory operation node and adds it to a graph.
+    - `hipGraphBatchMemOpNodeGetParams`  returns the pointer of parameters from the batch memory operation node.
+    - `hipGraphBatchMemOpNodeSetParams`  sets parameters for the batch memory operation node.
+    - `hipGraphExecBatchMemOpNodeSetParams`  sets the parameters for a batch memory operation node in the given executable graph.
+    - `hipLinkAddData` adds SPIRV code object data to linker instance with options.
+    - `hipLinkAddFile` adds SPIRV code object file to linker instance with options.
+    - `hipLinkCreate`  creates linker instance at runtime with options.
+    - `hipLinkComplete` completes linking of program and output linker binary to use with hipModuleLoadData.
+    - `hipLinkDestroy`  deletes linker instance.
+
 ### Changed
-* Added new environment variable
-    - `DEBUG_HIP_7_PREVIEW` This is used for enabling the backward incompatible changes before the next major ROCm release 7.0. By default this is set to 0. Users can set this variable to 0x1, to match the behavior of hipGetLastError with its corresponding CUDA API.
+
 * roc-obj* tools are being deprecated, and will be removed in an upcoming release.
-    - Perl package dependencies are now RECOMENDS or SUGGESTS.  Users will need to install these themselves.
+    - Perl package dependencies are now RECOMMENDS or SUGGESTS.  Users will need to install these themselves.
     - Support for ROCm Object tooling has moved into llvm-objdump provided by package rocm-llvm.
 
-- The `_sync()` version of crosslane builtins such as `shfl_sync()`,
-  `__all_sync()` and `__any_sync()`, continue to be hidden behind the
-  preprocessor macro `HIP_ENABLE_WARP_SYNC_BUILTINS`, and will be enabled
-  unconditionally in a future ROCm release.
+### Removed
+
+* HIP API `hipExtHostAlloc`.
+
+### Optimized
+
+* `hipGraphLaunch` parallelism is improved for complex data-parallel graphs.
+* Round-robin queue mechanism is updated for command scheduling. For multi-streams execution, HSA queue from null stream lock is freed and won't occupy the queue ID after the kernel in the stream is finished.
+* The HIP runtime doesn't free bitcode object before code generation. It adds a cache, which allows compiled code objects to be reused instead of recompiling. This improves performance on multi-GPU systems.
+
+### Resolved issues
+
+* Out of memory error on Windows. When the user calls `hipMalloc` for device memory allocation while specifying a size larger than the available device memory, the HIP runtime fixes the error in the API implementation, allocating the available device memory plus system memory (shared virtual memory). This fix is not available on Linux.
+
+### Upcoming changes
+ 
+The following are the list of backwards incompatible changes planned for the upcoming major ROCm release.
+ 
+* Signature changes in APIs to match corresponding CUDA APIs,
+    - `hiprtcCreatreProgram`
+    - `hiprtcCompileProgram`
+    - `hipCtxGetApiVersion`
+* Behaviour of `hipPointerGetAttributes` is changed to match corresponding CUDA API in version 11 and later releases.
+* Return error/value codes update in the following hip APIs, they now match the corresponding CUDA APIs,
+    - `hipModuleLaunchKernel`
+    - `hipExtModuleLaunchKernel`
+    - `hipModuleLaunchCooperativeKernel`
+    - `hipGetTextureAlignmentOffset`
+    - `hipTexObjectCreate`
+    - `hipBindTexture2D`
+    - `hipBindTextureToArray`
+    - `hipModuleLoad`
+    - `hipLaunchCooperativeKernelMultiDevice`
+    - `hipExtLaunchCooperativeKernelMultiDevice`
+ 
+* HIPRTC implementation, the compilation of hiprtc now uses  namespace ` __hip_internal`, instead of the standard headers `std`.
+* Stream capture mode update in the following hip APIs. Stream can only be captured in relax mode, to match the behavior of the corresponding CUDA APIs,
+   - `hipMallocManaged`
+   - `hipMemAdvise`
+   - `hipLaunchCooperativeKernelMultiDevice`
+   - `hipDeviceSetCacheConfig`
+   - `hipDeviceSetSharedMemConfig`
+   - `hipMemPoolCreate`
+   - `hipMemPoolDestory`
+   - `hipDeviceSetMemPool`
+   - `hipEventQuery`
+* The implementation of `hipStreamAddCallback` is updated, to match the behaviour of CUDA.
+* Removal of hiprtc symbols from hip library.
+    - hiprtc will be a independent library, all symbols supported in hip library are removed.
+    - Any application using hiprtc APIs should link explicitly with hiprtc library.
+    - This change makes the usage of hiprtc library on Linux the same as on Windows, and matches the behaviour of CUDA nvrtc.
+* Removal of deprecated struct `HIP_MEMSET_NODE_PARAMS`, developers can use definition `hipMemsetParams` instead.
+
+
+## HIP 6.3.2 for ROCm 6.3.2
+
+### Added
+
+* Tracking of Heterogeneous System Architecture (HSA) handlers:
+    - Adds an atomic counter to track the outstanding HSA handlers.
+    - Waits on CPU for the callbacks if the number exceeds the defined value.
+* Codes to capture Architected Queueing Language (AQL) packets for HIP graph memory copy node between host and device. HIP enqueues AQL packets during graph launch.
+* Control to use system pool implementation in runtime commands handling. By default, it is disabled.
+* A new path to avoid `WaitAny` calls in `AsyncEventsLoop`. The new path is selected by default.
+* Runtime control on decrement counter only if event is popped. There is a new way to restore dead signals cleanup for the old path.
+* A new logic in runtime to track the age of events from the kernel mode driver.
+
+### Optimized
+
+* HSA callback performance. The HIP runtime creates and submits commands in the queue and interacts with HSA through a callback function. HIP waits for the CPU status from HSA to optimize handling of events, profiling, commands, and HSA signals for higher performance.
+* Runtime optimisation which combines all logic of `WaitAny` in a single processing loop and avoids extra memory allocations or reference counting. The runtime won't spin on the CPU if all events are busy.
+* Multi-threaded dispatches for performance improvement.
+* Command submissions and processing between CPU and GPU by introducing a way to limit the software batch size.
+* Switch to `std::shared_mutex` in book/keep logic in streams from multiple threads simultaneously, for performance improvement in specific customer applications.
+* `std::shared_mutex` is used in memory object mapping, for performance improvement.
+
+### Resolved issues
+
+* Race condition in multi-threaded producer/consumer scenario with `hipMallocFromPoolAsync`.
+* Segmentation fault with `hipStreamLegacy` while using the API `hipStreamWaitEvent`.
+* Usage of `hipStreamLegacy` in HIP event record.
+* A soft hang in graph execution process from HIP user object. The fix handles the release of graph execution object properly considering synchronization on the device/stream. The user application now behaves the same with  hipUserObject  on both the AMD ROCm and NVIDIA CUDA platforms.
+
+
+## HIP 6.3.1 for ROCm 6.3.1
+
+### Added
+
+* An activeQueues set that tracks only the queues that have a command submitted to them, which allows fast iteration in `waitActiveStreams`.
+
+### Resolved issues
+
+* A Deadlock in a specific customer application by preventing hipLaunchKernel latency degradation with number of idle streams.
+
 
 ## HIP 6.3 for ROCm 6.3
 
-### Changed
-
-* Un-deprecated HIP APIs
-    - `hipHostAlloc`
-    - `hipFreeHost`
+### Added
 
 * New HIP APIs
     - `hipGraphExecGetFlags`  returns the flags on executable graph.
@@ -34,13 +134,29 @@ Full documentation for HIP is available at [rocm.docs.amd.com](https://rocm.docs
     - `hipDrvGraphExecMemcpyNodeSetParams`  sets the parameters for a memcpy node in the given graphExec.
     - `hipDrvGraphExecMemsetNodeSetParams`  sets the parameters for a memset node in the given graphExec.
 
+### Changed
+
+* Un-deprecated HIP APIs
+    - `hipHostAlloc`
+    - `hipFreeHost`
+
+### Optimized
+
+* Disabled CPU wait in device synchronize to avoid idle time in applications such as Hugging Face models and PyTorch.
+* Optimized multi-threaded dispatches to improve performance.
+* Limited the software batch size to control the number of command submissions for runtime to handle efficiently.
+* Optimizes HSA callback performance when a large number of events are recorded by multiple threads and submitted to multiple GPUs.
+
 ### Resolved issues
 
-
-- The `_sync()` version of crosslane builtins such as `shfl_sync()`,
+* Soft hang in runtime wait event when run TensorFlow.
+* Memory leak in the API `hipGraphInstantiate` when kernel is launched using `hipExtLaunchKernelGGL` with event.
+* Memory leak when the API `hipGraphAddMemAllocNode` is called.
+* The `_sync()` version of crosslane builtins such as `shfl_sync()`,
   `__all_sync()` and `__any_sync()`, continue to be hidden behind the
   preprocessor macro `HIP_ENABLE_WARP_SYNC_BUILTINS`, and will be enabled
   unconditionally in the next ROCm release.
+
 
 ## HIP 6.2.41134 for ROCm 6.2.1
 
