@@ -26,7 +26,7 @@ hipError_t hipMemcpyAsync_mrfs(void* dst, const void* src, size_t sizeBytes,
                              hipMemcpyKind kind, hip::Stream& stream);
 
 // Our intercepted synchronization functions
-hipError_t interceptedHipDeviceSynchronize();
-hipError_t interceptedHipStreamSynchronize(hipStream_t stream);
+void interceptedHipDeviceSynchronize();
+void interceptedHipStreamSynchronize(hipStream_t stream);
 
 } // namespace hip
