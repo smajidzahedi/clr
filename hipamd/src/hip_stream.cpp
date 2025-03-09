@@ -24,6 +24,7 @@
 #include "thread/monitor.hpp"
 #include "hip_prof_api.h"
 #include <atomic>
+#include "hip_mrfs.hpp"
 
 namespace hip {
 
@@ -369,6 +370,10 @@ hipError_t hipStreamSynchronize_common(hipStream_t stream) {
 // ================================================================================================
 hipError_t hipStreamSynchronize(hipStream_t stream) {
   HIP_INIT_API(hipStreamSynchronize, stream);
+
+  // intercept stream synchronize call first to join threads
+  interceptedHipStreamSynchronize(stream);
+
   HIP_RETURN(hipStreamSynchronize_common(stream));
 }
 

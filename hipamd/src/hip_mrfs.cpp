@@ -268,31 +268,19 @@ hipError_t hipMemcpyAsync_mrfs(void* dst, const void* src, size_t sizeBytes, hip
 }
 
 // Device synchronization
-inline hipError_t interceptedHipDeviceSynchronize() {
+void interceptedHipDeviceSynchronize() {
   MRFS_LOG("HIPAPI", "interceptedHipDeviceSynchronize called");
   // Wait for all memory operations to complete
   ThreadManager::instance().pool()->waitForAll();
-
-  MRFS_LOG("HIPAPI", "Calling original ihipDeviceSynchronize");
-  hipError_t result = ihipDeviceSynchronize();
-
-  MRFS_LOG("HIPAPI", "ihipDeviceSynchronize returned " << result);
-  return result;
 }
 
 // Stream synchronization
-inline hipError_t interceptedHipStreamSynchronize(hipStream_t streamHandle) {
+void interceptedHipStreamSynchronize(hipStream_t streamHandle) {
   MRFS_LOG("HIPAPI", "interceptedHipStreamSynchronize called for stream " << streamHandle);
 
   hip::Stream* stream = reinterpret_cast<hip::Stream*>(streamHandle);
   // Wait for stream operations to complete
   ThreadManager::instance().pool()->waitForStream(stream);
-
-  MRFS_LOG("HIPAPI", "Calling original ihipStreamSynchronize");
-  hipError_t result = ihipStreamSynchronize(streamHandle);
-
-  MRFS_LOG("HIPAPI", "ihipStreamSynchronize returned " << result);
-  return result;
 }
 
 }  // namespace hip
