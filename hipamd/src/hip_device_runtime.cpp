@@ -445,7 +445,7 @@ hipError_t hipDeviceGetAttribute(int* pi, hipDeviceAttribute_t attr, int device)
       break;
     case hipDeviceAttributeAccessPolicyMaxWindowSize:
       *pi = prop.accessPolicyMaxWindowSize;
-       break;
+      break;
     default:
       HIP_RETURN(hipErrorInvalidValue);
   }
@@ -546,10 +546,10 @@ hipError_t hipDeviceGetPCIBusId(char* pciBusId, int len, int device) {
   HIP_RETURN_ONFAIL(ihipGetDeviceProperties(&prop, device));
   auto* deviceHandle = g_devices[device]->devices()[0];
   snprintf (pciBusId, len, "%04x:%02x:%02x.%01x",
-                    prop.pciDomainID,
-                    prop.pciBusID,
-                    prop.pciDeviceID,
-                    deviceHandle->info().deviceTopology_.pcie.function);
+    prop.pciDomainID,
+    prop.pciBusID,
+    prop.pciDeviceID,
+    deviceHandle->info().deviceTopology_.pcie.function);
 
   HIP_RETURN(len <= 12 ? hipErrorInvalidValue : hipSuccess);
 }
@@ -622,8 +622,8 @@ hipError_t hipDeviceSynchronize() {
   // intercept device synchronize call first to join threads
   interceptedHipDeviceSynchronize();
 
-  constexpr bool kDoWaitForCpu = false;
-  hip::getCurrentDevice()->SyncAllStreams(kDoWaitForCpu);
+  // constexpr bool kDoWaitForCpu = false;
+  // hip::getCurrentDevice()->SyncAllStreams(kDoWaitForCpu);
   HIP_RETURN(hipSuccess);
 }
 
