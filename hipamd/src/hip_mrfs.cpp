@@ -5,17 +5,20 @@
 #include <mutex>
 #include <vector>
 #include <map>
+#include <queue>
 #include <atomic>
 #include <condition_variable>
 #include <chrono>
+#include <unistd.h>
 #include "thread/thread.hpp"
+#include <time.h>
 
 #define MRFS_DEBUG 0
 
 #if MRFS_DEBUG
 #define MRFS_LOG(tag, message)                                                                     \
   do {                                                                                             \
-    std::cerr << "[" << tag << "] " << message << std::endl;                                       \
+    std::cout << "[" << tag << "] " << message << std::endl;                                       \
   } while (0)
 #else
 #define MRFS_LOG(tag, message)                                                                     \
@@ -25,6 +28,21 @@
 
 namespace hip {
 
+// Default to 1GB chunk size
+constexpr size_t DEFAULT_MEMCPY_CHUNK_SIZE = 128ULL * 1024 * 1024;
+static size_t gMemcpyChunkSize = DEFAULT_MEMCPY_CHUNK_SIZE;
+
+// Default process bandwidth quota (10 GB/s)
+constexpr double DEFAULT_PROCESS_BANDWIDTH_QUOTA = 20.0 * 1024 * 1024 * 1024;
+
+size_t getMemcpyChunkSize() { return gMemcpyChunkSize; }
+
+void setMemcpyChunkSize(size_t newChunkSize) {
+  if (newChunkSize > 0) {
+    gMemcpyChunkSize = newChunkSize;
+  }
+}
+
 // Forward declarations
 class Device;
 class Stream;
@@ -32,37 +50,80 @@ extern hipError_t ihipMemcpy_validate(void* dst, const void* src, size_t sizeByt
                                       hipMemcpyKind kind);
 extern Device* getCurrentDevice();
 
-// Process quota management
+struct QueueId {
+  int deviceId;
+  pid_t processId;
+
+  // For using QueueId as a map key
+  bool operator<(const QueueId& other) const {
+    if (deviceId != other.deviceId) return deviceId < other.deviceId;
+    return processId < other.processId;
+  }
+
+  bool operator==(const QueueId& other) const {
+    return deviceId == other.deviceId && processId == other.processId;
+  }
+};
+
+// Struct used to keep track of memory copy operations
+struct MemcpyTask {
+  void* dst;
+  const void* src;
+  size_t sizeBytes;
+  hipMemcpyKind kind;
+  hip::Stream* stream;
+  QueueId queueId;
+  std::atomic<bool> completed{false};
+};
+
+// quota management
 class QuotaManager {
   private:
-  std::map<int, size_t> _processQuotas;
-  std::map<int, size_t> _processUsage;
+  // Store bandwidth quotas in bytes per second for each (device, process) queue
+  std::map<QueueId, double> _queueQuotas;
+  std::map<QueueId, double> _queueUsage;
   std::mutex _mutex;
   std::thread _resetThread;
   std::atomic<bool> _stopResetThread{false};
+  double _totalProcessQuota;
+  std::map<pid_t, double> _processQuotas;
+  std::map<pid_t, double> _processUsage;  // Track usage at process level
 
   void quotaResetThreadFunction() {
     MRFS_LOG("QUOTA", "Quota reset thread started");
     while (!_stopResetThread) {
       // Sleep for 1 second
-      std::this_thread::sleep_for(std::chrono::seconds(1));
+      struct timespec ts;
+      ts.tv_sec = 1;  // 1 second
+      ts.tv_nsec = 0;
 
-      // Reset all process usage
+      nanosleep(&ts, NULL);
+
+      // Reset all queue usage
       std::lock_guard<std::mutex> lock(_mutex);
-      for (auto& usage : _processUsage) {
-        size_t oldUsage = usage.second;
-        usage.second = 0;
+      for (auto& usage : _queueUsage) {
+        double oldUsage = usage.second;
+        usage.second = 0.0;
         MRFS_LOG("QUOTA",
-                 "Reset quota usage for process " << usage.first << " from " << oldUsage
-                                                  << " to 0 bytes");
+                 "Reset bandwidth for queue (device=" << usage.first.deviceId
+                                                      << ", process=" << usage.first.processId
+                                                      << ") from " << oldUsage << " B/s to 0 B/s");
+      }
+
+      // Reset process usage too
+      for (auto& usage : _processUsage) {
+        double oldUsage = usage.second;
+        usage.second = 0.0;
+        MRFS_LOG("QUOTA",
+                 "Reset bandwidth for process " << usage.first << " from " << oldUsage
+                                                << " B/s to 0 B/s");
       }
     }
   }
 
-  QuotaManager() {
+  QuotaManager() : _totalProcessQuota(DEFAULT_PROCESS_BANDWIDTH_QUOTA) {
     // Start the reset thread
     _resetThread = std::thread(&QuotaManager::quotaResetThreadFunction, this);
-    MRFS_LOG("QUOTA", "QuotaManager initialized with reset thread");
   }
 
   // Destructor to clean up thread
@@ -79,290 +140,498 @@ class QuotaManager {
     return manager;
   }
 
-  // Set quota for a process
-  void setQuota(int processId, size_t quotaBytes) {
+  // Set total quota for a process (in bytes per second)
+  void setProcessQuota(pid_t processId, double bandwidthBytesPerSec) {
     std::lock_guard<std::mutex> lock(_mutex);
-    _processQuotas[processId] = quotaBytes;
-    MRFS_LOG("QUOTA", "Set quota for process " << processId << " to " << quotaBytes << " bytes");
+    _processQuotas[processId] = bandwidthBytesPerSec;
+    _processUsage[processId] = 0.0;  // Initialize process usage
+
+    // Reallocate quotas for all queues associated with this process
+    reallocateQuotas(processId);
+
+    MRFS_LOG("QUOTA",
+             "Set total bandwidth quota for process " << processId << " to " << bandwidthBytesPerSec
+                                                      << " B/s");
   }
 
-  // Check if operation is within quota
-  bool checkQuota(int processId, size_t sizeBytes) {
+  void reallocateQuotas(pid_t processId) {
+    // Find all queues for this process
+    std::vector<QueueId> processQueues;
+    for (const auto& quota : _queueQuotas) {
+      if (quota.first.processId == processId) {
+        processQueues.push_back(quota.first);
+      }
+    }
+
+    if (processQueues.empty()) {
+      return;
+    }
+
+    // Calculate total process quota
+    double processQuota = _processQuotas[processId];
+
+    size_t totalChunks = static_cast<size_t>(processQuota / DEFAULT_MEMCPY_CHUNK_SIZE);
+    size_t chunksPerQueue = totalChunks / processQueues.size();
+    size_t remainingChunks = totalChunks % processQueues.size();
+
+    // Allocate quota to each queue
+    for (size_t i = 0; i < processQueues.size(); i++) {
+      const auto& queueId = processQueues[i];
+
+      double queueQuota = chunksPerQueue * DEFAULT_MEMCPY_CHUNK_SIZE;
+
+      // Last queue gets any remaining chunks
+      if (i == processQueues.size() - 1) {
+        queueQuota += remainingChunks * DEFAULT_MEMCPY_CHUNK_SIZE;
+
+        double remainingBytes = processQuota - (totalChunks * DEFAULT_MEMCPY_CHUNK_SIZE);
+        queueQuota += remainingBytes;
+      }
+
+      _queueQuotas[queueId] = queueQuota;
+      MRFS_LOG("QUOTA",
+               "Allocated " << queueQuota << " B/s to queue (device=" << queueId.deviceId
+                            << ", process=" << queueId.processId << "), " << (i + 1) << " of "
+                            << processQueues.size() << " queues");
+    }
+  }
+
+  void registerQueue(const QueueId& queueId) {
     std::lock_guard<std::mutex> lock(_mutex);
 
-    // If no quota is set, allow the operation
-    if (_processQuotas.find(processId) == _processQuotas.end()) {
-      return true;
+    if (_queueQuotas.find(queueId) != _queueQuotas.end()) {
+      return;
     }
+    _queueUsage[queueId] = 0.0;
 
-    // Initialize usage if not present - ie first time process requesting bandwidth
-    if (_processUsage.find(processId) == _processUsage.end()) {
-      _processUsage[processId] = 0;
-    }
-
-    // Check if operation would exceed quota
-    if (_processUsage[processId] + sizeBytes <= _processQuotas[processId]) {
-      _processUsage[processId] += sizeBytes;
+    // Get process quota
+    if (_processQuotas.find(queueId.processId) == _processQuotas.end()) {
+      _processQuotas[queueId.processId] = _totalProcessQuota;
+      _processUsage[queueId.processId] = 0.0;  // Initialize process usage
       MRFS_LOG("QUOTA",
-               "Process " << processId << " using " << sizeBytes << " bytes, total usage: "
-                          << _processUsage[processId] << "/" << _processQuotas[processId]);
+               "Set default process quota for process " << queueId.processId << " to "
+                                                        << _totalProcessQuota << " B/s");
+    }
+
+    // Count how many queues exist for this process now including this one
+    int queueCount = 0;
+    for (const auto& quota : _queueQuotas) {
+      if (quota.first.processId == queueId.processId) {
+        queueCount++;
+      }
+    }
+    queueCount++;
+
+    // Split the quota evenly here
+    double processQuota = _processQuotas[queueId.processId];
+    double queueQuota = processQuota / queueCount;
+
+
+    _queueQuotas[queueId] = queueQuota;
+    MRFS_LOG("QUOTA",
+             "Allocated " << queueQuota << " B/s to queue (device=" << queueId.deviceId
+                          << ", process=" << queueId.processId << "), 1 of " << queueCount
+                          << " queues");
+
+    // Reallocate quotas for all other queues in this process
+    for (auto& quota : _queueQuotas) {
+      if (quota.first.processId == queueId.processId && !(quota.first == queueId)) {
+        quota.second = queueQuota;
+        MRFS_LOG("QUOTA",
+                 "Reallocated " << queueQuota << " B/s to queue (device=" << quota.first.deviceId
+                                << ", process=" << quota.first.processId << ")");
+      }
+    }
+  }
+
+  // Check if operation is within quota for a queue
+  bool checkQuota(const QueueId& queueId, size_t sizeBytes) {
+    std::lock_guard<std::mutex> lock(_mutex);
+
+    // Register queue if not already registered
+    if (_queueQuotas.find(queueId) == _queueQuotas.end()) {
+      registerQueue(queueId);
+    }
+
+    // Initialize usage if not present - i.e., first time queue requesting bandwidth
+    if (_queueUsage.find(queueId) == _queueUsage.end()) {
+      _queueUsage[queueId] = 0.0;
+    }
+
+    pid_t processId = queueId.processId;
+    if (_processUsage.find(processId) == _processUsage.end()) {
+      _processUsage[processId] = 0.0;
+    }
+
+    if (_processUsage[processId] + sizeBytes <= _processQuotas[processId]) {
+      MRFS_LOG("QUOTA",
+               "Queue (device=" << queueId.deviceId << ", process=" << queueId.processId
+                                << ") pre-check passed for " << sizeBytes
+                                << " bytes, process usage: " << _processUsage[processId] << "/"
+                                << _processQuotas[processId] << " B/s");
       return true;
     }
 
     MRFS_LOG("QUOTA",
-             "Process " << processId << " quota exceeded: " << _processUsage[processId] << " + "
-                        << sizeBytes << " > " << _processQuotas[processId]);
+             "Queue (device=" << queueId.deviceId << ", process=" << queueId.processId
+                              << ") process quota exceeded: " << _processUsage[processId] << " + "
+                              << sizeBytes << " > " << _processQuotas[processId] << " B/s");
     return false;
   }
 
-  // Release quota when task completes
-  void releaseQuota(int processId, size_t sizeBytes) {
+
+  void updateUsage(const QueueId& queueId, size_t sizeBytes, double executionTimeSec) {
     std::lock_guard<std::mutex> lock(_mutex);
-    if (_processUsage.find(processId) != _processUsage.end()) {
-      if (_processUsage[processId] >= sizeBytes) {
-        _processUsage[processId] -= sizeBytes;
-      } else {
-        _processUsage[processId] = 0;
+
+    if (executionTimeSec > 0) {
+      double actualBandwidth = static_cast<double>(sizeBytes) / executionTimeSec;
+
+      // Initialize queue usage if needed
+      if (_queueUsage.find(queueId) == _queueUsage.end()) {
+        _queueUsage[queueId] = 0.0;
       }
+
+      // Initialize process usage if needed
+      pid_t processId = queueId.processId;
+      if (_processUsage.find(processId) == _processUsage.end()) {
+        _processUsage[processId] = 0.0;
+      }
+
+      // Update both queue and process usage
+      _queueUsage[queueId] += sizeBytes;
+      _processUsage[processId] += sizeBytes;
+
       MRFS_LOG("QUOTA",
-               "Process " << processId << " released " << sizeBytes
-                          << " bytes, remaining usage: " << _processUsage[processId]);
+               "Queue (device=" << queueId.deviceId << ", process=" << queueId.processId
+                                << ") used " << actualBandwidth << " B/s (" << sizeBytes
+                                << " bytes in " << executionTimeSec
+                                << "s), process usage: " << _processUsage[processId] << "/"
+                                << _processQuotas[processId] << " B/s");
+
+      // Add rate limiting based on process quota, not queue quota
+      double expectedTime = static_cast<double>(sizeBytes) / _processQuotas[processId];
+      if (executionTimeSec < expectedTime) {
+        double sleepTime = expectedTime - executionTimeSec;
+        MRFS_LOG("QUOTA",
+                 "Limiting rate by sleeping for " << sleepTime << "s to match process quota");
+        std::this_thread::sleep_for(std::chrono::duration<double>(sleepTime));
+      }
     }
   }
 };
 
-// Struct used to keep track of memory copy operations
-struct MemcpyTask {
-  void* dst;
-  const void* src;
-  size_t sizeBytes;
-  hipMemcpyKind kind;
-  hip::Stream* stream;
-  int deviceId;
-  int processId;
-  std::atomic<bool> completed{false};
-};
-
-// Thread pool for paralell memory operations
+// Thread pool
 class MemcpyThreadPool {
   private:
-  std::vector<std::thread> _workers;
-  std::vector<std::shared_ptr<MemcpyTask>> _tasks;
+  // Queue per (device, process) pair
+  std::map<QueueId, std::queue<std::shared_ptr<MemcpyTask>>> _queues;
+
+  // One dedicated worker thread per queue
+  std::map<QueueId, std::thread> _queueWorkers;
+
+  // Track tasks by stream for synchronization
   std::map<hip::Stream*, std::vector<std::shared_ptr<MemcpyTask>>> _streamTasks;
-  std::mutex _mutex;
-  std::condition_variable _condition;
-  std::atomic<bool> _stop{false};
-  std::atomic<int> _taskCount{0};
 
-  void workerFunction() {
+  // Use pointers for condition_variables since they cannot be copied or moved
+  std::map<QueueId, std::unique_ptr<std::condition_variable>> _queueConditions;
+  std::map<QueueId, std::atomic<bool>> _queueStopFlags;
+
+  std::mutex _queuesMutex;
+  std::mutex _streamsMutex;
+
+  std::vector<int> _deviceIds;
+
+  void createQueueWorker(const QueueId& queueId) {
+    _queueWorkers[queueId] = std::thread(&MemcpyThreadPool::queueWorkerFunction, this, queueId);
+  }
+
+  void queueWorkerFunction(const QueueId& queueId) {
     amd::Thread::init();
-    MRFS_LOG("WORKER", "Thread started");
 
-    while (!_stop) {
+    while (!_queueStopFlags[queueId]) {
       std::shared_ptr<MemcpyTask> task;
 
-      // Get a task
+      // Get a task from the queue
       {
-        std::unique_lock<std::mutex> lock(_mutex);
-        _condition.wait(lock, [this] { return _stop || !_tasks.empty(); });
+        std::unique_lock<std::mutex> lock(_queuesMutex);
 
-        if (_stop && _tasks.empty()) break;
+        auto& condition = *_queueConditions[queueId];
+        auto& queue = _queues[queueId];
 
-        if (!_tasks.empty()) {
-          task = _tasks.back();
-          _tasks.pop_back();
-          MRFS_LOG("WORKER",
-                   "Got task: " << task->sizeBytes << " bytes, src=" << task->src
-                                << ", dst=" << task->dst);
+        // Wait until there's work or we're stopping
+        condition.wait(
+            lock, [this, &queue, &queueId] { return _queueStopFlags[queueId] || !queue.empty(); });
+
+        if (_queueStopFlags[queueId] && queue.empty()) {
+          break;  // No more tasks and stopping
+        }
+
+        if (!queue.empty()) {
+          task = queue.front();
+          queue.pop();
         }
       }
 
       // Process the task
       if (task) {
-        (void)hipSetDevice(task->deviceId);
-        MRFS_LOG("WORKER", "Executing task on device " << task->deviceId);
+        (void)hipSetDevice(task->queueId.deviceId);
+
+        struct timespec startTime;
+        clock_gettime(CLOCK_MONOTONIC, &startTime);
+
         (void)ihipMemcpy(task->dst, task->src, task->sizeBytes, task->kind, *(task->stream), true);
-        MRFS_LOG("WORKER", "Task completed: " << task->sizeBytes << " bytes");
 
         // Wait for device to finish task
         hipError_t status = hipStreamSynchronize_spt(reinterpret_cast<hipStream_t>(task->stream));
-        if (status != hipSuccess) {
-          MRFS_LOG("WORKER", "Stream synchronize failed with error " << status);
-        }
 
-        // TODO: uncomment following line if quota should be released after task is completed
-        // ^ (double check with Maizi)
-        QuotaManager::instance().releaseQuota(task->processId, task->sizeBytes);
+        struct timespec endTime;
+        clock_gettime(CLOCK_MONOTONIC, &endTime);
+
+        // Convert to seconds
+        double executionTimeSec =
+            (endTime.tv_sec - startTime.tv_sec) + (endTime.tv_nsec - startTime.tv_nsec) / 1e9;
+
+        MRFS_LOG("WORKER",
+                 "Task completed: " << task->sizeBytes << " bytes in " << executionTimeSec
+                                    << " seconds");
+
+        // Update quota usage with actual measured bandwidth
+        QuotaManager::instance().updateUsage(task->queueId, task->sizeBytes, executionTimeSec);
 
         task->completed.store(true);
       }
     }
+  }
 
-    MRFS_LOG("WORKER", "Thread exiting");
+  // Ensure a queue and associated worker thread exists
+  void ensureQueueExists(const QueueId& queueId) {
+    // First check if queue exists - do this with the lock
+    {
+      std::lock_guard<std::mutex> lock(_queuesMutex);
+      if (_queues.find(queueId) != _queues.end()) {
+        // Queue already exists, nothing to do
+        return;
+      }
+    }
+
+    // Create the queue and necessary components
+    {
+      std::lock_guard<std::mutex> lock(_queuesMutex);
+
+      // Initialize queue
+      _queues[queueId] = std::queue<std::shared_ptr<MemcpyTask>>();
+
+      // Create a new condition variable with a unique_ptr
+      _queueConditions[queueId] = std::make_unique<std::condition_variable>();
+      _queueStopFlags[queueId] = false;
+    }
+
+    // Register queue with QuotaManager - do this outside the lock
+    QuotaManager::instance().registerQueue(queueId);
+
+    // Start dedicated worker thread for this queue
+    createQueueWorker(queueId);
   }
 
   public:
-  // Initialize with specified number of threads
-  MemcpyThreadPool(int numThreads) {
-    MRFS_LOG("POOL", "Creating thread pool with " << numThreads << " threads");
-    for (int i = 0; i < numThreads; ++i) {
-      _workers.emplace_back(&MemcpyThreadPool::workerFunction, this);
-    }
+  // Initialize with available device IDs
+  MemcpyThreadPool(const std::vector<int>& deviceIds) : _deviceIds(deviceIds) {
+    // Queues will be created dynamically as needed
   }
 
   // Clean up
   ~MemcpyThreadPool() {
-    MRFS_LOG("POOL", "Shutting down thread pool");
+    // Signal all worker threads to stop
     {
-      std::lock_guard<std::mutex> lock(_mutex);
-      _stop = true;
+      std::lock_guard<std::mutex> lock(_queuesMutex);
+      for (auto& pair : _queueStopFlags) {
+        pair.second = true;
+      }
     }
-    _condition.notify_all();
 
-    for (auto& worker : _workers) {
-      if (worker.joinable()) worker.join();
+    // Notify all condition variables
+    for (auto& pair : _queueConditions) {
+      pair.second->notify_all();
     }
-    MRFS_LOG("POOL", "Thread pool shutdown complete");
+
+    // Join all worker threads
+    for (auto& pair : _queueWorkers) {
+      if (pair.second.joinable()) {
+        pair.second.join();
+      }
+    }
   }
 
   // Add a new memory copy task
   bool addTask(void* dst, const void* src, size_t sizeBytes, hipMemcpyKind kind,
-               hip::Stream* stream, int deviceId, int processId) {
+               hip::Stream* stream, int deviceId) {
+    // Create queue ID with current process ID
+    QueueId queueId = {deviceId, getpid()};
+
+    // Ensure queue exists with dedicated worker
+    ensureQueueExists(queueId);
+
     // Define retry parameters
-    // TODO: this should be defined based on 1s / retry delay (ie retry to ensure 1s has passed
-    // since last fail)
     const int maxRetries = 20;
-    // TODO: may want to change with cond var to speed up delay
-    const auto retryDelay = std::chrono::milliseconds(50);
+    const auto retryDelay = std::chrono::milliseconds(100);
     int retryCount = 0;
 
     while (retryCount < maxRetries) {
       // Check with scheduler for quota before issuing load
-      if (QuotaManager::instance().checkQuota(processId, sizeBytes)) {
+      if (QuotaManager::instance().checkQuota(queueId, sizeBytes)) {
         auto task = std::make_shared<MemcpyTask>();
         task->dst = dst;
         task->src = src;
         task->sizeBytes = sizeBytes;
         task->kind = kind;
         task->stream = stream;
-        task->deviceId = deviceId;
-        task->processId = processId;
-
-        int taskId = ++_taskCount;
-        MRFS_LOG("POOL",
-                 "Adding task " << taskId << ": " << sizeBytes << " bytes, device=" << deviceId
-                                << ", stream=" << stream << ", process=" << processId);
+        task->queueId = queueId;
 
         {
-          std::lock_guard<std::mutex> lock(_mutex);
-          _tasks.push_back(task);
+          // Add to the queue
+          std::lock_guard<std::mutex> queueLock(_queuesMutex);
+          _queues[queueId].push(task);
+
+          // Notify the worker thread
+          if (_queueConditions.find(queueId) != _queueConditions.end()) {
+            _queueConditions[queueId]->notify_one();
+          }
+        }
+
+        {
+          // Track by stream for synchronization
+          std::lock_guard<std::mutex> streamLock(_streamsMutex);
           _streamTasks[stream].push_back(task);
         }
 
-        _condition.notify_one();
         return true;
       }
 
       // Quota exceeded, log and wait before retry
       retryCount++;
       MRFS_LOG("POOL",
-               "Process " << processId << " quota exceeded, retry " << retryCount << "/"
-                          << maxRetries << ", waiting " << retryDelay.count() << "ms");
+               "Queue (device=" << queueId.deviceId << ", process=" << queueId.processId
+                                << ") bandwidth quota exceeded, retry " << retryCount << "/"
+                                << maxRetries << ", waiting " << retryDelay.count() << "ms");
 
       std::this_thread::sleep_for(retryDelay);
     }
 
-    // If we've exhausted all retries --> then log and return failure
+    // If we've exhausted all retries, log and return failure
     MRFS_LOG("POOL",
-             "Task rejected: quota exceeded for process " << processId << " after " << maxRetries
-                                                          << " retries");
+             "Task rejected: bandwidth quota exceeded for queue (device="
+                 << queueId.deviceId << ", process=" << queueId.processId << ") after "
+                 << maxRetries << " retries");
     return false;
+  }
+
+  // Add multiple chunked memory copy tasks
+  bool addChunkedTasks(void* dst, const void* src, size_t totalSize, hipMemcpyKind kind,
+                       hip::Stream* stream, int deviceId) {
+    const size_t chunkSize = getMemcpyChunkSize();
+    const size_t numChunks = (totalSize + chunkSize - 1) / chunkSize;  // Ceiling division
+
+    MRFS_LOG("POOL",
+             "Chunking " << totalSize << " byte request into " << numChunks << " chunks of "
+                         << chunkSize << " bytes or less");
+
+    for (size_t i = 0; i < numChunks; i++) {
+      // Calculate chunk boundaries
+      size_t offset = i * chunkSize;
+      size_t currentChunkSize = std::min(chunkSize, totalSize - offset);
+
+      // Calculate pointers for this chunk
+      void* chunkDst = static_cast<char*>(dst) + offset;
+      const void* chunkSrc = static_cast<const char*>(src) + offset;
+
+      // Add the chunk as a separate task
+      bool success = addTask(chunkDst, chunkSrc, currentChunkSize, kind, stream, deviceId);
+
+      if (!success) {
+        MRFS_LOG(
+            "POOL",
+            "Failed to add chunk " << i + 1 << "/" << numChunks << ". Aborting remaining chunks.");
+        return false;
+      }
+    }
+
+    return true;
   }
 
   // Wait for stream tasks to complete
   void waitForStream(hip::Stream* stream) {
-    MRFS_LOG("SYNC", "Waiting for stream " << stream);
     std::vector<std::shared_ptr<MemcpyTask>> streamTasks;
 
     {
-      std::lock_guard<std::mutex> lock(_mutex);
+      std::lock_guard<std::mutex> lock(_streamsMutex);
       if (_streamTasks.find(stream) != _streamTasks.end()) {
         streamTasks = _streamTasks[stream];
-        MRFS_LOG("SYNC", "Found " << streamTasks.size() << " tasks for stream " << stream);
-      } else {
-        MRFS_LOG("SYNC", "No tasks found for stream " << stream);
       }
     }
 
     for (auto& task : streamTasks) {
       while (!task->completed.load()) {
-        // MRFS_LOG("SYNC", "Waiting for task to complete: " << task->sizeBytes << " bytes");
         std::this_thread::yield();
       }
     }
 
     // Clean up completed tasks
     {
-      std::lock_guard<std::mutex> lock(_mutex);
+      std::lock_guard<std::mutex> lock(_streamsMutex);
       if (_streamTasks.find(stream) != _streamTasks.end()) {
-        MRFS_LOG(
-            "SYNC",
-            "Clearing " << _streamTasks[stream].size() << " completed tasks for stream " << stream);
         _streamTasks[stream].clear();
       }
     }
-
-    MRFS_LOG("SYNC", "Stream " << stream << " sync complete");
   }
 
   // Wait for all tasks to complete
   void waitForAll() {
-    MRFS_LOG("SYNC", "Waiting for all tasks to complete");
     std::vector<std::shared_ptr<MemcpyTask>> allTasks;
 
     {
-      std::lock_guard<std::mutex> lock(_mutex);
+      std::lock_guard<std::mutex> lock(_streamsMutex);
       // Get all tasks from all streams
       for (auto& pair : _streamTasks) {
         allTasks.insert(allTasks.end(), pair.second.begin(), pair.second.end());
       }
-      // Also include any tasks not yet assigned to a worker
-      allTasks.insert(allTasks.end(), _tasks.begin(), _tasks.end());
-
-      MRFS_LOG("SYNC", "Found " << allTasks.size() << " total tasks across all streams");
     }
 
     // Wait for all tasks to complete
     for (auto& task : allTasks) {
       while (!task->completed.load()) {
-        // MRFS_LOG("SYNC",
-        //          "Waiting for task to complete: " << task->sizeBytes
-        //                                           << " bytes, stream=" << task->stream);
         std::this_thread::yield();
       }
     }
 
     // Clean up
     {
-      std::lock_guard<std::mutex> lock(_mutex);
-      MRFS_LOG("SYNC", "Clearing all completed tasks");
+      std::lock_guard<std::mutex> lock(_streamsMutex);
       _streamTasks.clear();
     }
-
-    MRFS_LOG("SYNC", "All tasks complete");
   }
 };
 
-// Singleton to manage the thread pool
+// Singleton to manage the thread pool per process
 class ThreadManager {
   private:
   std::unique_ptr<MemcpyThreadPool> _pool;
+  pid_t _processId;
 
   ThreadManager() {
     int numDevices = 1;
     (void)hipGetDeviceCount(&numDevices);
-    MRFS_LOG("MANAGER", "Initializing thread manager with " << numDevices << " devices");
-    _pool = std::make_unique<MemcpyThreadPool>(numDevices * 2);
+
+    // Get the list of available device IDs
+    std::vector<int> deviceIds;
+    for (int i = 0; i < numDevices; ++i) {
+      deviceIds.push_back(i);
+    }
+
+    _processId = getpid();
+    _pool = std::make_unique<MemcpyThreadPool>(deviceIds);
+
+    // Set initial process quota
+    QuotaManager::instance().setProcessQuota(_processId, DEFAULT_PROCESS_BANDWIDTH_QUOTA);
   }
 
   public:
@@ -372,44 +641,47 @@ class ThreadManager {
   }
 
   MemcpyThreadPool* pool() { return _pool.get(); }
-};
 
+  // Set bandwidth quota for the current process
+  void setProcessBandwidthQuota(double bandwidthBytesPerSec) {
+    QuotaManager::instance().setProcessQuota(_processId, bandwidthBytesPerSec);
+  }
+};
 
 hipError_t hipMemcpyAsync_mrfs(void* dst, const void* src, size_t sizeBytes, hipMemcpyKind kind,
                                hip::Stream& stream) {
-  MRFS_LOG("HIPAPI",
-           "hipMemcpyAsync_mrfs: " << sizeBytes << " bytes, src=" << src << ", dst=" << dst);
-
   if (sizeBytes == 0) {
-    MRFS_LOG("HIPAPI", "Empty copy, returning success");
     return hipSuccess;
   }
 
   hipError_t status = ihipMemcpy_validate(dst, src, sizeBytes, kind);
   if (status != hipSuccess) {
-    MRFS_LOG("HIPAPI", "Validation failed with error " << status);
     return status;
   }
 
   if (src == dst && kind == hipMemcpyDefault) {
-    MRFS_LOG("HIPAPI", "Same src/dst with default kind, skipping");
     return hipSuccess;
   }
 
-  // Get current process ID
-  int processId = getpid();
+  ThreadManager::instance().setProcessBandwidthQuota(DEFAULT_PROCESS_BANDWIDTH_QUOTA);
 
-  size_t quotaSize = 1ULL * 1024 * 1024 * 1024;  // Set initial quota to some arbitrary bandwidth
+  // Check if we need to chunk the request
+  bool accepted = false;
+  size_t chunkSize = getMemcpyChunkSize();
+  int deviceId = getCurrentDevice()->deviceId();
 
-  QuotaManager::instance().setQuota(processId, quotaSize);
-
-  // Add to thread pool with quota check and retry logic
-  MRFS_LOG("HIPAPI", "Submitting to thread pool for process " << processId);
-  bool accepted = ThreadManager::instance().pool()->addTask(
-      dst, src, sizeBytes, kind, &stream, getCurrentDevice()->deviceId(), processId);
+  if (sizeBytes > chunkSize) {
+    // Large request -> divide into chunks
+    accepted = ThreadManager::instance().pool()->addChunkedTasks(dst, src, sizeBytes, kind, &stream,
+                                                                 deviceId);
+  } else {
+    // Small request -> process normally
+    accepted =
+        ThreadManager::instance().pool()->addTask(dst, src, sizeBytes, kind, &stream, deviceId);
+  }
 
   if (!accepted) {
-    MRFS_LOG("HIPAPI", "Task rejected due to quota constraints after all retries");
+    MRFS_LOG("HIPAPI", "Task rejected due to bandwidth quota constraints after all retries");
     return hipErrorOutOfMemory;  // Or another appropriate error code
   }
 
@@ -418,7 +690,6 @@ hipError_t hipMemcpyAsync_mrfs(void* dst, const void* src, size_t sizeBytes, hip
 
 // Device synchronization
 void interceptedHipDeviceSynchronize() {
-  MRFS_LOG("HIPAPI", "interceptedHipDeviceSynchronize called");
   // Wait for all memory operations to complete
   ThreadManager::instance().pool()->waitForAll();
 
@@ -429,14 +700,10 @@ void interceptedHipDeviceSynchronize() {
 
 // Stream synchronization
 hipError_t interceptedHipStreamSynchronize(hipStream_t streamHandle) {
-  MRFS_LOG("HIPAPI", "interceptedHipStreamSynchronize called for stream " << streamHandle);
-
   hip::Stream* stream = reinterpret_cast<hip::Stream*>(streamHandle);
   // Wait for stream operations to complete
   ThreadManager::instance().pool()->waitForStream(stream);
 
-  // // Call the original stream sync function
-  // HIP_RETURN(hipStreamSynchronize_common(stream));
   return hipSuccess;
 }
 
