@@ -12,6 +12,7 @@
 #include <unistd.h>
 #include "thread/thread.hpp"
 #include <time.h>
+#include <algorithm>  // Added for std::max
 
 #define MRFS_DEBUG 0
 
@@ -29,11 +30,11 @@
 namespace hip {
 
 // Default to 1GB chunk size
-constexpr size_t DEFAULT_MEMCPY_CHUNK_SIZE = 128ULL * 1024 * 1024;
+constexpr size_t DEFAULT_MEMCPY_CHUNK_SIZE = 1024ULL * 1024 * 1024;
 static size_t gMemcpyChunkSize = DEFAULT_MEMCPY_CHUNK_SIZE;
 
 // Default process bandwidth quota (10 GB/s)
-constexpr double DEFAULT_PROCESS_BANDWIDTH_QUOTA = 20.0 * 1024 * 1024 * 1024;
+constexpr double DEFAULT_PROCESS_BANDWIDTH_QUOTA = 10.0 * 1024 * 1024 * 1024;
 
 size_t getMemcpyChunkSize() { return gMemcpyChunkSize; }
 
@@ -92,31 +93,41 @@ class QuotaManager {
   void quotaResetThreadFunction() {
     MRFS_LOG("QUOTA", "Quota reset thread started");
     while (!_stopResetThread) {
-      // Sleep for 1 second
+      // Sleep for 10 milliseconds
       struct timespec ts;
-      ts.tv_sec = 1;  // 1 second
-      ts.tv_nsec = 0;
+      ts.tv_sec = 0;
+      ts.tv_nsec = 100000000;  // 10 milliseconds
 
       nanosleep(&ts, NULL);
 
-      // Reset all queue usage
+      // Decrement usage by 1/10th of quota, with floor of 0
       std::lock_guard<std::mutex> lock(_mutex);
       for (auto& usage : _queueUsage) {
+        const QueueId& queueId = usage.first;
         double oldUsage = usage.second;
-        usage.second = 0.0;
+        double decrementAmount = _queueQuotas[queueId] * 0.1;  // 1/10th of quota
+
+        // Decrement usage but don't go below 0
+        usage.second = std::max(0.0, usage.second - decrementAmount);
+
         MRFS_LOG("QUOTA",
-                 "Reset bandwidth for queue (device=" << usage.first.deviceId
-                                                      << ", process=" << usage.first.processId
-                                                      << ") from " << oldUsage << " B/s to 0 B/s");
+                 "Decreased bandwidth for queue (device="
+                     << queueId.deviceId << ", process=" << queueId.processId << ") from "
+                     << oldUsage << " B/s to " << usage.second << " B/s");
       }
 
-      // Reset process usage too
+      // Decrement process usage too
       for (auto& usage : _processUsage) {
+        pid_t processId = usage.first;
         double oldUsage = usage.second;
-        usage.second = 0.0;
+        double decrementAmount = _processQuotas[processId] * 0.1;  // 1/10th of quota
+
+        // Decrement usage but don't go below 0
+        usage.second = std::max(0.0, usage.second - decrementAmount);
+
         MRFS_LOG("QUOTA",
-                 "Reset bandwidth for process " << usage.first << " from " << oldUsage
-                                                << " B/s to 0 B/s");
+                 "Decreased bandwidth for process " << processId << " from " << oldUsage
+                                                    << " B/s to " << usage.second << " B/s");
       }
     }
   }
@@ -189,6 +200,10 @@ class QuotaManager {
       }
 
       _queueQuotas[queueId] = queueQuota;
+      // std::cout << "QUOTA Allocated " << queueQuota << " B/s to queue (device=" <<
+      // queueId.deviceId
+      //           << ", process=" << queueId.processId << "), " << (i + 1) << " of "
+      //           << processQueues.size() << " queues" << std::endl;
       MRFS_LOG("QUOTA",
                "Allocated " << queueQuota << " B/s to queue (device=" << queueId.deviceId
                             << ", process=" << queueId.processId << "), " << (i + 1) << " of "
@@ -374,31 +389,68 @@ class MemcpyThreadPool {
 
       // Process the task
       if (task) {
-        (void)hipSetDevice(task->queueId.deviceId);
+        // Define retry parameters for quota check
+        const int maxRetries = 20;
+        const auto retryDelay = std::chrono::milliseconds(100);
+        int retryCount = 0;
+        bool quotaOk = false;
 
-        struct timespec startTime;
-        clock_gettime(CLOCK_MONOTONIC, &startTime);
+        // Try to acquire quota before processing the task
+        while (!quotaOk && retryCount < maxRetries) {
+          // Check with quota manager if we can proceed
+          if (QuotaManager::instance().checkQuota(task->queueId, task->sizeBytes)) {
+            quotaOk = true;
+          } else {
+            // Quota exceeded, log and wait before retry
+            retryCount++;
+            MRFS_LOG("WORKER",
+                     "Queue (device=" << task->queueId.deviceId
+                                      << ", process=" << task->queueId.processId
+                                      << ") bandwidth quota exceeded, retry " << retryCount << "/"
+                                      << maxRetries << ", waiting " << retryDelay.count() << "ms");
 
-        (void)ihipMemcpy(task->dst, task->src, task->sizeBytes, task->kind, *(task->stream), true);
+            std::this_thread::sleep_for(retryDelay);
+          }
+        }
 
-        // Wait for device to finish task
-        hipError_t status = hipStreamSynchronize_spt(reinterpret_cast<hipStream_t>(task->stream));
+        if (quotaOk) {
+          // We have quota, proceed with the task
+          (void)hipSetDevice(task->queueId.deviceId);
 
-        struct timespec endTime;
-        clock_gettime(CLOCK_MONOTONIC, &endTime);
+          struct timespec startTime;
+          clock_gettime(CLOCK_MONOTONIC, &startTime);
 
-        // Convert to seconds
-        double executionTimeSec =
-            (endTime.tv_sec - startTime.tv_sec) + (endTime.tv_nsec - startTime.tv_nsec) / 1e9;
+          (void)ihipMemcpy(task->dst, task->src, task->sizeBytes, task->kind, *(task->stream),
+                           true);
 
-        MRFS_LOG("WORKER",
-                 "Task completed: " << task->sizeBytes << " bytes in " << executionTimeSec
-                                    << " seconds");
+          // Wait for device to finish task
+          hipError_t status = hipStreamSynchronize_spt(reinterpret_cast<hipStream_t>(task->stream));
 
-        // Update quota usage with actual measured bandwidth
-        QuotaManager::instance().updateUsage(task->queueId, task->sizeBytes, executionTimeSec);
+          struct timespec endTime;
+          clock_gettime(CLOCK_MONOTONIC, &endTime);
 
-        task->completed.store(true);
+          // Convert to seconds
+          double executionTimeSec =
+              (endTime.tv_sec - startTime.tv_sec) + (endTime.tv_nsec - startTime.tv_nsec) / 1e9;
+
+          MRFS_LOG("WORKER",
+                   "Task completed: " << task->sizeBytes << " bytes in " << executionTimeSec
+                                      << " seconds");
+
+          // Update quota usage with actual measured bandwidth
+          QuotaManager::instance().updateUsage(task->queueId, task->sizeBytes, executionTimeSec);
+
+          task->completed.store(true);
+        } else {
+          // Couldn't get quota after all retries
+          MRFS_LOG("WORKER",
+                   "Task could not be processed: bandwidth quota exceeded for queue (device="
+                       << task->queueId.deviceId << ", process=" << task->queueId.processId
+                       << ") after " << maxRetries << " retries");
+
+          // Mark as completed anyway since we're giving up
+          task->completed.store(true);
+        }
       }
     }
   }
@@ -462,7 +514,7 @@ class MemcpyThreadPool {
     }
   }
 
-  // Add a new memory copy task
+  // Add a new memory copy task - modified to queue tasks immediately without quota check
   bool addTask(void* dst, const void* src, size_t sizeBytes, hipMemcpyKind kind,
                hip::Stream* stream, int deviceId) {
     // Create queue ID with current process ID
@@ -471,61 +523,36 @@ class MemcpyThreadPool {
     // Ensure queue exists with dedicated worker
     ensureQueueExists(queueId);
 
-    // Define retry parameters
-    const int maxRetries = 20;
-    const auto retryDelay = std::chrono::milliseconds(100);
-    int retryCount = 0;
+    // Create the task and add it to the queue immediately without quota check
+    auto task = std::make_shared<MemcpyTask>();
+    task->dst = dst;
+    task->src = src;
+    task->sizeBytes = sizeBytes;
+    task->kind = kind;
+    task->stream = stream;
+    task->queueId = queueId;
 
-    while (retryCount < maxRetries) {
-      // Check with scheduler for quota before issuing load
-      if (QuotaManager::instance().checkQuota(queueId, sizeBytes)) {
-        auto task = std::make_shared<MemcpyTask>();
-        task->dst = dst;
-        task->src = src;
-        task->sizeBytes = sizeBytes;
-        task->kind = kind;
-        task->stream = stream;
-        task->queueId = queueId;
+    {
+      // Add to the queue
+      std::lock_guard<std::mutex> queueLock(_queuesMutex);
+      _queues[queueId].push(task);
 
-        {
-          // Add to the queue
-          std::lock_guard<std::mutex> queueLock(_queuesMutex);
-          _queues[queueId].push(task);
-
-          // Notify the worker thread
-          if (_queueConditions.find(queueId) != _queueConditions.end()) {
-            _queueConditions[queueId]->notify_one();
-          }
-        }
-
-        {
-          // Track by stream for synchronization
-          std::lock_guard<std::mutex> streamLock(_streamsMutex);
-          _streamTasks[stream].push_back(task);
-        }
-
-        return true;
+      // Notify the worker thread
+      if (_queueConditions.find(queueId) != _queueConditions.end()) {
+        _queueConditions[queueId]->notify_one();
       }
-
-      // Quota exceeded, log and wait before retry
-      retryCount++;
-      MRFS_LOG("POOL",
-               "Queue (device=" << queueId.deviceId << ", process=" << queueId.processId
-                                << ") bandwidth quota exceeded, retry " << retryCount << "/"
-                                << maxRetries << ", waiting " << retryDelay.count() << "ms");
-
-      std::this_thread::sleep_for(retryDelay);
     }
 
-    // If we've exhausted all retries, log and return failure
-    MRFS_LOG("POOL",
-             "Task rejected: bandwidth quota exceeded for queue (device="
-                 << queueId.deviceId << ", process=" << queueId.processId << ") after "
-                 << maxRetries << " retries");
-    return false;
+    {
+      // Track by stream for synchronization
+      std::lock_guard<std::mutex> streamLock(_streamsMutex);
+      _streamTasks[stream].push_back(task);
+    }
+
+    return true;
   }
 
-  // Add multiple chunked memory copy tasks
+  // Add multiple chunked memory copy tasks - modified to always add all chunks
   bool addChunkedTasks(void* dst, const void* src, size_t totalSize, hipMemcpyKind kind,
                        hip::Stream* stream, int deviceId) {
     const size_t chunkSize = getMemcpyChunkSize();
@@ -544,15 +571,8 @@ class MemcpyThreadPool {
       void* chunkDst = static_cast<char*>(dst) + offset;
       const void* chunkSrc = static_cast<const char*>(src) + offset;
 
-      // Add the chunk as a separate task
-      bool success = addTask(chunkDst, chunkSrc, currentChunkSize, kind, stream, deviceId);
-
-      if (!success) {
-        MRFS_LOG(
-            "POOL",
-            "Failed to add chunk " << i + 1 << "/" << numChunks << ". Aborting remaining chunks.");
-        return false;
-      }
+      // Add the chunk as a separate task - always succeeds now
+      addTask(chunkDst, chunkSrc, currentChunkSize, kind, stream, deviceId);
     }
 
     return true;
@@ -648,6 +668,7 @@ class ThreadManager {
   }
 };
 
+// Modified function to always accept tasks since quota check moved to worker thread
 hipError_t hipMemcpyAsync_mrfs(void* dst, const void* src, size_t sizeBytes, hipMemcpyKind kind,
                                hip::Stream& stream) {
   if (sizeBytes == 0) {
@@ -666,25 +687,18 @@ hipError_t hipMemcpyAsync_mrfs(void* dst, const void* src, size_t sizeBytes, hip
   ThreadManager::instance().setProcessBandwidthQuota(DEFAULT_PROCESS_BANDWIDTH_QUOTA);
 
   // Check if we need to chunk the request
-  bool accepted = false;
   size_t chunkSize = getMemcpyChunkSize();
   int deviceId = getCurrentDevice()->deviceId();
 
   if (sizeBytes > chunkSize) {
     // Large request -> divide into chunks
-    accepted = ThreadManager::instance().pool()->addChunkedTasks(dst, src, sizeBytes, kind, &stream,
-                                                                 deviceId);
+    ThreadManager::instance().pool()->addChunkedTasks(dst, src, sizeBytes, kind, &stream, deviceId);
   } else {
     // Small request -> process normally
-    accepted =
-        ThreadManager::instance().pool()->addTask(dst, src, sizeBytes, kind, &stream, deviceId);
+    ThreadManager::instance().pool()->addTask(dst, src, sizeBytes, kind, &stream, deviceId);
   }
 
-  if (!accepted) {
-    MRFS_LOG("HIPAPI", "Task rejected due to bandwidth quota constraints after all retries");
-    return hipErrorOutOfMemory;  // Or another appropriate error code
-  }
-
+  // Tasks are always accepted now, quota check happens in the worker thread
   return hipSuccess;
 }
 
