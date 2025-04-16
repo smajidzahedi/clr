@@ -127,7 +127,6 @@ bool HostQueue::terminate() {
     Agent::postCommandQueueFree(as_cl(this->asCommandQueue()));
   }
 
-  device_.removeFromActiveQueues(this);
 
   return true;
 }
@@ -175,10 +174,10 @@ void HostQueue::finish(bool cpu_wait) {
         device_.removeFromActiveQueues(this);
         lastEnqueueCommand_->release();
         lastEnqueueCommand_ = nullptr;
+        vdev()->ReleaseHwQueue(); // we can only release HwQueue when no commmand in quque.
       }
     }
   }
-
   command->release();
   ClPrint(LOG_DEBUG, LOG_CMD, "All commands finished");
 }
