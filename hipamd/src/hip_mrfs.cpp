@@ -34,7 +34,7 @@ constexpr size_t DEFAULT_MEMCPY_CHUNK_SIZE = 1024ULL * 1024 * 1024;
 static size_t gMemcpyChunkSize = DEFAULT_MEMCPY_CHUNK_SIZE;
 
 // Default process bandwidth quota (10 GB/s)
-constexpr double DEFAULT_PROCESS_BANDWIDTH_QUOTA = 10.0 * 1024 * 1024 * 1024;
+constexpr double DEFAULT_PROCESS_BANDWIDTH_QUOTA = 25.0 * 1024 * 1024 * 1024;
 
 size_t getMemcpyChunkSize() { return gMemcpyChunkSize; }
 
@@ -53,17 +53,11 @@ extern Device* getCurrentDevice();
 
 struct QueueId {
   int deviceId;
-  pid_t processId;
 
   // For using QueueId as a map key
-  bool operator<(const QueueId& other) const {
-    if (deviceId != other.deviceId) return deviceId < other.deviceId;
-    return processId < other.processId;
-  }
+  bool operator<(const QueueId& other) const { return deviceId < other.deviceId; }
 
-  bool operator==(const QueueId& other) const {
-    return deviceId == other.deviceId && processId == other.processId;
-  }
+  bool operator==(const QueueId& other) const { return deviceId == other.deviceId; }
 };
 
 // Struct used to keep track of memory copy operations
@@ -80,15 +74,15 @@ struct MemcpyTask {
 // quota management
 class QuotaManager {
   private:
-  // Store bandwidth quotas in bytes per second for each (device, process) queue
+  // Store bandwidth quotas in bytes per second for each (device) queue
   std::map<QueueId, double> _queueQuotas;
   std::map<QueueId, double> _queueUsage;
   std::mutex _mutex;
   std::thread _resetThread;
   std::atomic<bool> _stopResetThread{false};
   double _totalProcessQuota;
-  std::map<pid_t, double> _processQuotas;
-  std::map<pid_t, double> _processUsage;  // Track usage at process level
+  double _processQuota;
+  double _processUsage;
 
   void quotaResetThreadFunction() {
     MRFS_LOG("QUOTA", "Quota reset thread started");
@@ -111,28 +105,28 @@ class QuotaManager {
         usage.second = std::max(0.0, usage.second - decrementAmount);
 
         MRFS_LOG("QUOTA",
-                 "Decreased bandwidth for queue (device="
-                     << queueId.deviceId << ", process=" << queueId.processId << ") from "
-                     << oldUsage << " B/s to " << usage.second << " B/s");
+                 "Decreased bandwidth for queue (device=" << queueId.deviceId << ") from "
+                                                          << oldUsage << " B/s to " << usage.second
+                                                          << " B/s");
       }
 
       // Decrement process usage too
-      for (auto& usage : _processUsage) {
-        pid_t processId = usage.first;
-        double oldUsage = usage.second;
-        double decrementAmount = _processQuotas[processId] * 0.1;  // 1/10th of quota
+      double oldUsage = _processUsage;
+      double decrementAmount = _processQuota * 0.1;  // 1/10th of quota
 
-        // Decrement usage but don't go below 0
-        usage.second = std::max(0.0, usage.second - decrementAmount);
+      // Decrement usage but don't go below 0
+      _processUsage = std::max(0.0, _processUsage - decrementAmount);
 
-        MRFS_LOG("QUOTA",
-                 "Decreased bandwidth for process " << processId << " from " << oldUsage
-                                                    << " B/s to " << usage.second << " B/s");
-      }
+      MRFS_LOG("QUOTA",
+               "Decreased bandwidth for process from " << oldUsage << " B/s to " << _processUsage
+                                                       << " B/s");
     }
   }
 
-  QuotaManager() : _totalProcessQuota(DEFAULT_PROCESS_BANDWIDTH_QUOTA) {
+  QuotaManager()
+      : _totalProcessQuota(DEFAULT_PROCESS_BANDWIDTH_QUOTA),
+        _processQuota(DEFAULT_PROCESS_BANDWIDTH_QUOTA),
+        _processUsage(0.0) {
     // Start the reset thread
     _resetThread = std::thread(&QuotaManager::quotaResetThreadFunction, this);
   }
@@ -151,63 +145,55 @@ class QuotaManager {
     return manager;
   }
 
-  // Set total quota for a process (in bytes per second)
-  void setProcessQuota(pid_t processId, double bandwidthBytesPerSec) {
+  // Set total quota (in bytes per second)
+  void setProcessQuota(int deviceId, double bandwidthBytesPerSec) {
     std::lock_guard<std::mutex> lock(_mutex);
-    _processQuotas[processId] = bandwidthBytesPerSec;
-    _processUsage[processId] = 0.0;  // Initialize process usage
+    _totalProcessQuota = bandwidthBytesPerSec;
+    _processQuota = bandwidthBytesPerSec;
+    _processUsage = 0.0;  // Reset process usage when setting new quota
 
-    // Reallocate quotas for all queues associated with this process
-    reallocateQuotas(processId);
+    // Reallocate quotas for all queues
+    reallocateQuotas(deviceId);
 
-    MRFS_LOG("QUOTA",
-             "Set total bandwidth quota for process " << processId << " to " << bandwidthBytesPerSec
-                                                      << " B/s");
+    MRFS_LOG("QUOTA", "Set total bandwidth quota to " << bandwidthBytesPerSec << " B/s");
   }
 
-  void reallocateQuotas(pid_t processId) {
-    // Find all queues for this process
-    std::vector<QueueId> processQueues;
+  void reallocateQuotas(int deviceId) {
+    // Find all queues
+    std::vector<QueueId> allQueues;
     for (const auto& quota : _queueQuotas) {
-      if (quota.first.processId == processId) {
-        processQueues.push_back(quota.first);
-      }
+      allQueues.push_back(quota.first);
     }
 
-    if (processQueues.empty()) {
+    if (allQueues.empty()) {
       return;
     }
 
-    // Calculate total process quota
-    double processQuota = _processQuotas[processId];
+    // Calculate total quota
+    double totalQuota = _totalProcessQuota;
 
-    size_t totalChunks = static_cast<size_t>(processQuota / DEFAULT_MEMCPY_CHUNK_SIZE);
-    size_t chunksPerQueue = totalChunks / processQueues.size();
-    size_t remainingChunks = totalChunks % processQueues.size();
+    size_t totalChunks = static_cast<size_t>(totalQuota / DEFAULT_MEMCPY_CHUNK_SIZE);
+    size_t chunksPerQueue = totalChunks / allQueues.size();
+    size_t remainingChunks = totalChunks % allQueues.size();
 
     // Allocate quota to each queue
-    for (size_t i = 0; i < processQueues.size(); i++) {
-      const auto& queueId = processQueues[i];
+    for (size_t i = 0; i < allQueues.size(); i++) {
+      const auto& queueId = allQueues[i];
 
       double queueQuota = chunksPerQueue * DEFAULT_MEMCPY_CHUNK_SIZE;
 
       // Last queue gets any remaining chunks
-      if (i == processQueues.size() - 1) {
+      if (i == allQueues.size() - 1) {
         queueQuota += remainingChunks * DEFAULT_MEMCPY_CHUNK_SIZE;
 
-        double remainingBytes = processQuota - (totalChunks * DEFAULT_MEMCPY_CHUNK_SIZE);
+        double remainingBytes = totalQuota - (totalChunks * DEFAULT_MEMCPY_CHUNK_SIZE);
         queueQuota += remainingBytes;
       }
 
       _queueQuotas[queueId] = queueQuota;
-      // std::cout << "QUOTA Allocated " << queueQuota << " B/s to queue (device=" <<
-      // queueId.deviceId
-      //           << ", process=" << queueId.processId << "), " << (i + 1) << " of "
-      //           << processQueues.size() << " queues" << std::endl;
       MRFS_LOG("QUOTA",
-               "Allocated " << queueQuota << " B/s to queue (device=" << queueId.deviceId
-                            << ", process=" << queueId.processId << "), " << (i + 1) << " of "
-                            << processQueues.size() << " queues");
+               "Allocated " << queueQuota << " B/s to queue (device=" << queueId.deviceId << "), "
+                            << (i + 1) << " of " << allQueues.size() << " queues");
     }
   }
 
@@ -219,42 +205,29 @@ class QuotaManager {
     }
     _queueUsage[queueId] = 0.0;
 
-    // Get process quota
-    if (_processQuotas.find(queueId.processId) == _processQuotas.end()) {
-      _processQuotas[queueId.processId] = _totalProcessQuota;
-      _processUsage[queueId.processId] = 0.0;  // Initialize process usage
-      MRFS_LOG("QUOTA",
-               "Set default process quota for process " << queueId.processId << " to "
-                                                        << _totalProcessQuota << " B/s");
-    }
-
-    // Count how many queues exist for this process now including this one
+    // Count how many queues exist now including this one
     int queueCount = 0;
     for (const auto& quota : _queueQuotas) {
-      if (quota.first.processId == queueId.processId) {
-        queueCount++;
-      }
+      queueCount++;
     }
     queueCount++;
 
     // Split the quota evenly here
-    double processQuota = _processQuotas[queueId.processId];
-    double queueQuota = processQuota / queueCount;
-
+    double totalQuota = _totalProcessQuota;
+    double queueQuota = totalQuota / queueCount;
 
     _queueQuotas[queueId] = queueQuota;
     MRFS_LOG("QUOTA",
              "Allocated " << queueQuota << " B/s to queue (device=" << queueId.deviceId
-                          << ", process=" << queueId.processId << "), 1 of " << queueCount
-                          << " queues");
+                          << "), 1 of " << queueCount << " queues");
 
-    // Reallocate quotas for all other queues in this process
+    // Reallocate quotas for all other queues
     for (auto& quota : _queueQuotas) {
-      if (quota.first.processId == queueId.processId && !(quota.first == queueId)) {
+      if (!(quota.first == queueId)) {
         quota.second = queueQuota;
         MRFS_LOG("QUOTA",
                  "Reallocated " << queueQuota << " B/s to queue (device=" << quota.first.deviceId
-                                << ", process=" << quota.first.processId << ")");
+                                << ")");
       }
     }
   }
@@ -273,27 +246,20 @@ class QuotaManager {
       _queueUsage[queueId] = 0.0;
     }
 
-    pid_t processId = queueId.processId;
-    if (_processUsage.find(processId) == _processUsage.end()) {
-      _processUsage[processId] = 0.0;
-    }
-
-    if (_processUsage[processId] + sizeBytes <= _processQuotas[processId]) {
+    // Check process quota first
+    if (_processUsage + sizeBytes <= _processQuota) {
       MRFS_LOG("QUOTA",
-               "Queue (device=" << queueId.deviceId << ", process=" << queueId.processId
-                                << ") pre-check passed for " << sizeBytes
-                                << " bytes, process usage: " << _processUsage[processId] << "/"
-                                << _processQuotas[processId] << " B/s");
+               "Queue (device=" << queueId.deviceId << ") pre-check passed for " << sizeBytes
+                                << " bytes, process usage: " << _processUsage << "/"
+                                << _processQuota << " B/s");
       return true;
     }
 
     MRFS_LOG("QUOTA",
-             "Queue (device=" << queueId.deviceId << ", process=" << queueId.processId
-                              << ") process quota exceeded: " << _processUsage[processId] << " + "
-                              << sizeBytes << " > " << _processQuotas[processId] << " B/s");
+             "Queue (device=" << queueId.deviceId << ") process quota exceeded: " << _processUsage
+                              << " + " << sizeBytes << " > " << _processQuota << " B/s");
     return false;
   }
-
 
   void updateUsage(const QueueId& queueId, size_t sizeBytes, double executionTimeSec) {
     std::lock_guard<std::mutex> lock(_mutex);
@@ -306,25 +272,18 @@ class QuotaManager {
         _queueUsage[queueId] = 0.0;
       }
 
-      // Initialize process usage if needed
-      pid_t processId = queueId.processId;
-      if (_processUsage.find(processId) == _processUsage.end()) {
-        _processUsage[processId] = 0.0;
-      }
-
       // Update both queue and process usage
       _queueUsage[queueId] += sizeBytes;
-      _processUsage[processId] += sizeBytes;
+      _processUsage += sizeBytes;
 
       MRFS_LOG("QUOTA",
-               "Queue (device=" << queueId.deviceId << ", process=" << queueId.processId
-                                << ") used " << actualBandwidth << " B/s (" << sizeBytes
-                                << " bytes in " << executionTimeSec
-                                << "s), process usage: " << _processUsage[processId] << "/"
-                                << _processQuotas[processId] << " B/s");
+               "Queue (device=" << queueId.deviceId << ") used " << actualBandwidth << " B/s ("
+                                << sizeBytes << " bytes in " << executionTimeSec
+                                << "s), process usage: " << _processUsage << "/" << _processQuota
+                                << " B/s");
 
       // Add rate limiting based on process quota, not queue quota
-      double expectedTime = static_cast<double>(sizeBytes) / _processQuotas[processId];
+      double expectedTime = static_cast<double>(sizeBytes) / _processQuota;
       if (executionTimeSec < expectedTime) {
         double sleepTime = expectedTime - executionTimeSec;
         MRFS_LOG("QUOTA",
@@ -338,7 +297,7 @@ class QuotaManager {
 // Thread pool
 class MemcpyThreadPool {
   private:
-  // Queue per (device, process) pair
+  // Queue per device
   std::map<QueueId, std::queue<std::shared_ptr<MemcpyTask>>> _queues;
 
   // One dedicated worker thread per queue
@@ -405,7 +364,6 @@ class MemcpyThreadPool {
             retryCount++;
             MRFS_LOG("WORKER",
                      "Queue (device=" << task->queueId.deviceId
-                                      << ", process=" << task->queueId.processId
                                       << ") bandwidth quota exceeded, retry " << retryCount << "/"
                                       << maxRetries << ", waiting " << retryDelay.count() << "ms");
 
@@ -445,8 +403,7 @@ class MemcpyThreadPool {
           // Couldn't get quota after all retries
           MRFS_LOG("WORKER",
                    "Task could not be processed: bandwidth quota exceeded for queue (device="
-                       << task->queueId.deviceId << ", process=" << task->queueId.processId
-                       << ") after " << maxRetries << " retries");
+                       << task->queueId.deviceId << ") after " << maxRetries << " retries");
 
           // Mark as completed anyway since we're giving up
           task->completed.store(true);
@@ -517,8 +474,8 @@ class MemcpyThreadPool {
   // Add a new memory copy task - modified to queue tasks immediately without quota check
   bool addTask(void* dst, const void* src, size_t sizeBytes, hipMemcpyKind kind,
                hip::Stream* stream, int deviceId) {
-    // Create queue ID with current process ID
-    QueueId queueId = {deviceId, getpid()};
+    // Create queue ID with device ID only
+    QueueId queueId = {deviceId};
 
     // Ensure queue exists with dedicated worker
     ensureQueueExists(queueId);
@@ -635,7 +592,6 @@ class MemcpyThreadPool {
 class ThreadManager {
   private:
   std::unique_ptr<MemcpyThreadPool> _pool;
-  pid_t _processId;
 
   ThreadManager() {
     int numDevices = 1;
@@ -647,11 +603,10 @@ class ThreadManager {
       deviceIds.push_back(i);
     }
 
-    _processId = getpid();
     _pool = std::make_unique<MemcpyThreadPool>(deviceIds);
 
-    // Set initial process quota
-    QuotaManager::instance().setProcessQuota(_processId, DEFAULT_PROCESS_BANDWIDTH_QUOTA);
+    // Set initial bandwidth quota
+    QuotaManager::instance().setProcessQuota(0, DEFAULT_PROCESS_BANDWIDTH_QUOTA);
   }
 
   public:
@@ -664,7 +619,8 @@ class ThreadManager {
 
   // Set bandwidth quota for the current process
   void setProcessBandwidthQuota(double bandwidthBytesPerSec) {
-    QuotaManager::instance().setProcessQuota(_processId, bandwidthBytesPerSec);
+    int currentDevice = getCurrentDevice()->deviceId();
+    QuotaManager::instance().setProcessQuota(currentDevice, bandwidthBytesPerSec);
   }
 };
 
