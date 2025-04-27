@@ -29,12 +29,16 @@
 
 namespace hip {
 
-// Default to 1GB chunk size
+// Default to 1024 Mb chunk size
 constexpr size_t DEFAULT_MEMCPY_CHUNK_SIZE = 1024ULL * 1024 * 1024;
 static size_t gMemcpyChunkSize = DEFAULT_MEMCPY_CHUNK_SIZE;
 
 // Default process bandwidth quota (10 GB/s)
-constexpr double DEFAULT_PROCESS_BANDWIDTH_QUOTA = 25.0 * 1024 * 1024 * 1024;
+constexpr double DEFAULT_PROCESS_BANDWIDTH_QUOTA = 22.0 * 1024 * 1024 * 1024;
+
+// TODO: define time window granularity, every time update usage is called, add whatever number of
+// bytes has been just transferred then, everytime check is called, compare the last time check was
+// called,
 
 size_t getMemcpyChunkSize() { return gMemcpyChunkSize; }
 
@@ -150,7 +154,6 @@ class QuotaManager {
     std::lock_guard<std::mutex> lock(_mutex);
     _totalProcessQuota = bandwidthBytesPerSec;
     _processQuota = bandwidthBytesPerSec;
-    _processUsage = 0.0;  // Reset process usage when setting new quota
 
     // Reallocate quotas for all queues
     reallocateQuotas(deviceId);
@@ -172,28 +175,17 @@ class QuotaManager {
     // Calculate total quota
     double totalQuota = _totalProcessQuota;
 
-    size_t totalChunks = static_cast<size_t>(totalQuota / DEFAULT_MEMCPY_CHUNK_SIZE);
-    size_t chunksPerQueue = totalChunks / allQueues.size();
-    size_t remainingChunks = totalChunks % allQueues.size();
+    // Simply divide the total quota evenly among all queues
+    double quotaPerQueue = totalQuota / allQueues.size();
 
     // Allocate quota to each queue
     for (size_t i = 0; i < allQueues.size(); i++) {
       const auto& queueId = allQueues[i];
+      _queueQuotas[queueId] = quotaPerQueue;
 
-      double queueQuota = chunksPerQueue * DEFAULT_MEMCPY_CHUNK_SIZE;
-
-      // Last queue gets any remaining chunks
-      if (i == allQueues.size() - 1) {
-        queueQuota += remainingChunks * DEFAULT_MEMCPY_CHUNK_SIZE;
-
-        double remainingBytes = totalQuota - (totalChunks * DEFAULT_MEMCPY_CHUNK_SIZE);
-        queueQuota += remainingBytes;
-      }
-
-      _queueQuotas[queueId] = queueQuota;
       MRFS_LOG("QUOTA",
-               "Allocated " << queueQuota << " B/s to queue (device=" << queueId.deviceId << "), "
-                            << (i + 1) << " of " << allQueues.size() << " queues");
+               "Allocated " << quotaPerQueue << " B/s to queue (device=" << queueId.deviceId
+                            << "), " << (i + 1) << " of " << allQueues.size() << " queues");
     }
   }
 
@@ -206,13 +198,8 @@ class QuotaManager {
     _queueUsage[queueId] = 0.0;
 
     // Count how many queues exist now including this one
-    int queueCount = 0;
-    for (const auto& quota : _queueQuotas) {
-      queueCount++;
-    }
-    queueCount++;
+    int queueCount = _queueQuotas.size() + 1;
 
-    // Split the quota evenly here
     double totalQuota = _totalProcessQuota;
     double queueQuota = totalQuota / queueCount;
 
@@ -247,7 +234,7 @@ class QuotaManager {
     }
 
     // Check process quota first
-    if (_processUsage + sizeBytes <= _processQuota) {
+    if (_queueUsage[queueId] + sizeBytes <= _queueQuotas[queueId]) {
       MRFS_LOG("QUOTA",
                "Queue (device=" << queueId.deviceId << ") pre-check passed for " << sizeBytes
                                 << " bytes, process usage: " << _processUsage << "/"
@@ -272,9 +259,8 @@ class QuotaManager {
         _queueUsage[queueId] = 0.0;
       }
 
-      // Update both queue and process usage
+      // Update queue usage for tracking
       _queueUsage[queueId] += sizeBytes;
-      _processUsage += sizeBytes;
 
       MRFS_LOG("QUOTA",
                "Queue (device=" << queueId.deviceId << ") used " << actualBandwidth << " B/s ("
