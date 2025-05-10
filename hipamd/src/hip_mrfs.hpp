@@ -14,19 +14,17 @@ extern std::thread* hipMemCpyThread;
 extern std::mutex threadMutex;
 
 // Forward declarations of the original sync functions we need to call
-extern hipError_t ihipDeviceSynchronize();
-extern hipError_t ihipStreamSynchronize(hipStream_t stream);
 extern hipError_t ihipMemcpy_validate(void* dst, const void* src, size_t sizeBytes,
-                                     hipMemcpyKind kind);
+                                      hipMemcpyKind kind);
 // extern hipError_t ihipMemcpy(void* dst, const void* src, size_t sizeBytes,
 //                            hipMemcpyKind kind, hip::Stream& stream, bool isAsync);
 
 // Our custom async implementation
-hipError_t hipMemcpyAsync_mrfs(void* dst, const void* src, size_t sizeBytes, 
-                             hipMemcpyKind kind, hip::Stream& stream);
+hipError_t hipMemcpyAsync_mrfs(void* dst, const void* src, size_t sizeBytes, hipMemcpyKind kind,
+                               hip::Stream& stream);
 
 // Our intercepted synchronization functions
 void interceptedHipDeviceSynchronize();
-void interceptedHipStreamSynchronize(hipStream_t stream);
+hipError_t interceptedHipStreamSynchronize(hipStream_t stream);
 
-} // namespace hip
+}  // namespace hip

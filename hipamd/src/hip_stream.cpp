@@ -372,9 +372,9 @@ hipError_t hipStreamSynchronize(hipStream_t stream) {
   HIP_INIT_API(hipStreamSynchronize, stream);
 
   // intercept stream synchronize call first to join threads
-  interceptedHipStreamSynchronize(stream);
+  HIP_RETURN(interceptedHipStreamSynchronize(stream));
 
-  HIP_RETURN(hipStreamSynchronize_common(stream));
+  // HIP_RETURN(hipStreamSynchronize_common(stream));
 }
 
 // ================================================================================================
