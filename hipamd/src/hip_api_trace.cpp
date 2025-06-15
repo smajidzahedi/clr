@@ -460,6 +460,7 @@ hipError_t hipMemcpy2DToArrayAsync(hipArray_t dst, size_t wOffset, size_t hOffse
                                    hipStream_t stream);
 hipError_t hipMemcpy3D(const struct hipMemcpy3DParms* p);
 hipError_t hipMemcpy3DAsync(const struct hipMemcpy3DParms* p, hipStream_t stream);
+hipError_t hipSetProcessQuota(size_t quota);
 hipError_t hipMemcpyAsync(void* dst, const void* src, size_t sizeBytes, hipMemcpyKind kind,
                           hipStream_t stream);
 hipError_t hipMemcpyAtoH(void* dst, hipArray_t srcArray, size_t srcOffset, size_t count);
@@ -1099,6 +1100,7 @@ void UpdateDispatchTable(HipDispatchTable* ptrDispatchTable) {
   ptrDispatchTable->hipMemcpy2DToArrayAsync_fn = hip::hipMemcpy2DToArrayAsync;
   ptrDispatchTable->hipMemcpy3D_fn = hip::hipMemcpy3D;
   ptrDispatchTable->hipMemcpy3DAsync_fn = hip::hipMemcpy3DAsync;
+  ptrDispatchTable->hipSetProcessQuota_fn = hip::hipSetProcessQuota;
   ptrDispatchTable->hipMemcpyAsync_fn = hip::hipMemcpyAsync;
   ptrDispatchTable->hipMemcpyAtoH_fn = hip::hipMemcpyAtoH;
   ptrDispatchTable->hipMemcpyDtoD_fn = hip::hipMemcpyDtoD;
@@ -1877,6 +1879,7 @@ HIP_ENFORCE_ABI(HipDispatchTable, hipGraphExecNodeSetParams_fn, 457);
 HIP_ENFORCE_ABI(HipDispatchTable, hipExternalMemoryGetMappedMipmappedArray_fn, 458)
 HIP_ENFORCE_ABI(HipDispatchTable, hipDrvGraphMemcpyNodeGetParams_fn, 459)
 HIP_ENFORCE_ABI(HipDispatchTable, hipDrvGraphMemcpyNodeSetParams_fn, 460)
+HIP_ENFORCE_ABI(HipDispatchTable, hipSetProcessQuota_fn, 461)
 
 // if HIP_ENFORCE_ABI entries are added for each new function pointer in the table, the number below
 // will be +1 of the number in the last HIP_ENFORCE_ABI line. E.g.:
@@ -1884,7 +1887,7 @@ HIP_ENFORCE_ABI(HipDispatchTable, hipDrvGraphMemcpyNodeSetParams_fn, 460)
 //  HIP_ENFORCE_ABI(<table>, <functor>, 8)
 //
 //  HIP_ENFORCE_ABI_VERSIONING(<table>, 9) <- 8 + 1 = 9
-HIP_ENFORCE_ABI_VERSIONING(HipDispatchTable, 461)
+HIP_ENFORCE_ABI_VERSIONING(HipDispatchTable, 462)
 
 static_assert(HIP_RUNTIME_API_TABLE_MAJOR_VERSION == 0 && HIP_RUNTIME_API_TABLE_STEP_VERSION == 4,
               "If you get this error, add new HIP_ENFORCE_ABI(...) code for the new function "

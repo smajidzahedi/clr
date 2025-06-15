@@ -564,6 +564,7 @@ typedef hipError_t (*t_hipMemcpy2DToArrayAsync)(hipArray_t dst, size_t wOffset, 
                                                 hipStream_t stream);
 typedef hipError_t (*t_hipMemcpy3D)(const struct hipMemcpy3DParms* p);
 typedef hipError_t (*t_hipMemcpy3DAsync)(const struct hipMemcpy3DParms* p, hipStream_t stream);
+typedef hipError_t (*t_hipSetProcessQuota)(size_t quota);
 typedef hipError_t (*t_hipMemcpyAsync)(void* dst, const void* src, size_t sizeBytes,
                                        hipMemcpyKind kind, hipStream_t stream);
 typedef hipError_t (*t_hipMemcpyAtoH)(void* dst, hipArray_t srcArray, size_t srcOffset,
@@ -1506,6 +1507,7 @@ struct HipDispatchTable {
   t_hipExternalMemoryGetMappedMipmappedArray hipExternalMemoryGetMappedMipmappedArray_fn;
   t_hipDrvGraphMemcpyNodeGetParams hipDrvGraphMemcpyNodeGetParams_fn;
   t_hipDrvGraphMemcpyNodeSetParams hipDrvGraphMemcpyNodeSetParams_fn;
+  t_hipSetProcessQuota hipSetProcessQuota_fn;
 
   // DO NOT EDIT ABOVE!
   // HIP_RUNTIME_API_TABLE_STEP_VERSION == 5

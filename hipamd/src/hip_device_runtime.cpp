@@ -618,9 +618,12 @@ hipError_t hipDeviceSetSharedMemConfig(hipSharedMemConfig config) {
 hipError_t hipDeviceSynchronize() {
   HIP_INIT_API(hipDeviceSynchronize);
   CHECK_SUPPORTED_DURING_CAPTURE();
-  // constexpr bool kDoWaitForCpu = false;
-  // hip::getCurrentDevice()->SyncAllStreams(kDoWaitForCpu);
-  interceptedHipDeviceSynchronize();
+#ifdef MRFS
+  ihipDeviceSynchronize_mrfs();
+#else
+  constexpr bool kDoWaitForCpu = false;
+  hip::getCurrentDevice()->SyncAllStreams(kDoWaitForCpu);
+#endif
   HIP_RETURN(hipSuccess);
 }
 

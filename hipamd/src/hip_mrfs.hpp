@@ -6,11 +6,10 @@
 #include "hip_internal.hpp"
 
 namespace hip {
-
-#define TASK_QUEUE_SIZE (1024 * 4)  // TODO: Fine tune this!
-#define TIME_WINDOW_MS (100)
-#define TIME_WINDOW_NS (TIME_WINDOW_MS * 1000 * 1000)
-#define REALLOCATE_PERIOD_MS (5 * TIME_WINDOW_MS)
+#define MRFS_MIN_CHUNK_SIZE 4096
+#define MRFS_M_CHANCE 4
+#define MRFS_TASK_QUEUE_SIZE (1024)  // TODO: Fine tune this!
+#define MRFS_REALLOCATE_PERIOD_NS (10000000) // Every 10 ms
 
 static uint64_t getCurrentTime() {
   struct timespec ts;
@@ -30,9 +29,8 @@ struct MemcpyTask {
 
 class TaskBuffer {
  private:
-  std::unique_ptr<MemcpyTask> buffer_[TASK_QUEUE_SIZE];
+  std::unique_ptr<MemcpyTask> buffer_[MRFS_TASK_QUEUE_SIZE];
 
-  // TODO: check compiler. For C++11 we don't need to initialize these!
   mutable std::mutex mutex_;
   std::condition_variable on_empty_;
   std::condition_variable on_not_empty_;
@@ -44,36 +42,40 @@ class TaskBuffer {
 
  public:
 
-  TaskBuffer(): head_(0), tail_(0), count_(0), capacity_(TASK_QUEUE_SIZE) {}
+  TaskBuffer(): head_(0), tail_(0), count_(0), capacity_(MRFS_TASK_QUEUE_SIZE) {}
 
-  bool push_back(std::vector<std::unique_ptr<MemcpyTask>> tasks) {
+  bool push_back(std::unique_ptr<MemcpyTask> task) {
     std::lock_guard<std::mutex> lock(mutex_);
-    size_t num_tasks = tasks.size();
 
-    if (count_ + num_tasks > capacity_)
+    if (count_ == capacity_)
       return false;
 
-    for (size_t i = 0; i < num_tasks; ++i) {
-      buffer_[tail_] = std::move(tasks[i]);
-      tail_ = (tail_ + 1) % capacity_;
-      ++count_;
-    }
+    buffer_[tail_] = std::move(task);
+    tail_ = (tail_ + 1) % capacity_;
+    ++count_;
 
-    on_empty_.notify_all();
+    on_empty_.notify_one();
     return true;
   }
 
-  std::unique_ptr<MemcpyTask> pop_front() {
+  void pop_front() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    on_empty_.wait(lock, [this]() { return count_ > 0; });
+    head_ = (head_ + 1) % capacity_;
+    --count_;
+    if (count_ == 0) {
+      on_not_empty_.notify_all();
+    }
+  }
+
+  std::unique_ptr<MemcpyTask> get_front() {
     std::unique_lock<std::mutex> lock(mutex_);
     on_empty_.wait(lock, [this]() { return count_ > 0; });
     std::unique_ptr<MemcpyTask> task = std::move(buffer_[head_]);
     buffer_[head_] = nullptr;
-    head_ = (head_ + 1) % capacity_;
-    --count_;
-    if (count_ == 0)
-      on_not_empty_.notify_all();
     return task;
   }
+
 
   int size() const {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -88,64 +90,53 @@ class TaskBuffer {
 
 class QuotaManager {
  private:
-  std::atomic<size_t> processQuotaBPS;
-  std::atomic<size_t> chunkSize;
   int deviceCount;
+  std::atomic<size_t> processQuotaBPS;
+  long pageSize;
 
-  std::vector<std::unique_ptr<std::atomic<int>>> deviceQuota;
-  std::vector<int> deviceUsage;
-  std::vector<uint64_t> lastUpdate;
+  std::vector<std::unique_ptr<std::atomic<size_t>>> deviceQuotaBPS;
   std::vector<std::unique_ptr<TaskBuffer>> buffers;
 
   std::vector<std::thread> workers;
   std::thread quotaManager;
   void workerFunction(int deviceId);
-  void reallocateDeviceQuota();
-
-  static QuotaManager* instance;
+  void reallocatedeviceQuotaBPW();
 
  protected:
   QuotaManager() {
     hipError_t _ = hipGetDeviceCount(&deviceCount);
-    processQuotaBPS = 22.0 * 1024 * 1024 * 1024;
-    chunkSize = (processQuotaBPS * TIME_WINDOW_MS) / 1000; //TODO figure out why CLion is giving warning!
+    processQuotaBPS.store(deviceCount * 8ULL * 1024 * 1024 * 1024, std::memory_order_relaxed);
 
-    deviceQuota.reserve(deviceCount);
-    deviceUsage.resize(deviceCount);
-    lastUpdate.resize(deviceCount);
+    deviceQuotaBPS.reserve(deviceCount);
     buffers.reserve(deviceCount);
-
 
     workers.resize(deviceCount);
     for (int i = 0; i < deviceCount; i++) {
-      deviceQuota.emplace_back(std::make_unique<std::atomic<int>>());
-      deviceUsage[i] = 0;
-      lastUpdate[i] = 0;
+      deviceQuotaBPS.emplace_back(std::make_unique<std::atomic<size_t>>(8ULL * 1024 * 1024 * 1024));
       buffers.emplace_back(std::make_unique<TaskBuffer>());
       workers[i] = std::thread(&QuotaManager::workerFunction, this, i);
-      quotaManager = std::thread(&QuotaManager::reallocateDeviceQuota, this);
     }
+    quotaManager = std::thread(&QuotaManager::reallocatedeviceQuotaBPW, this);
   }
 
  public:
   QuotaManager(QuotaManager& other) = delete;
   void operator=(const QuotaManager&) = delete;
-  static QuotaManager* GetInstance() {
-    if (instance == nullptr)
-      instance = new QuotaManager;
+  static QuotaManager& getInstance() {
+    static QuotaManager instance;
     return instance;
   }
 
-  void setProcessQuota(double quota);
-  void addChunkedTasks(void* dst, const void* src, size_t totalSize, hipMemcpyKind kind,
-                       hipStream_t stream, int deviceId);
+  void setProcessQuota(size_t quota);
+  bool addTask(void* dst, const void* src, size_t sizeBytes, hipMemcpyKind kind, hipStream_t stream,
+               int deviceId);
   void waitForDevice(int deviceId);
-  void enforceBW(uint64_t, size_t, int);
 };
 
-hipError_t hipMemcpyAsync_mrfs(void* dst, const void* src, size_t sizeBytes, hipMemcpyKind kind,
-                               hip::Stream& stream);
-void interceptedHipDeviceSynchronize();
-hipError_t interceptedHipStreamSynchronize(hipStream_t stream);
+hipError_t ihipMemcpyAsync_mrfs(void* dst, const void* src, size_t sizeBytes, hipMemcpyKind kind,
+                               hipStream_t stream);
+void ihipDeviceSynchronize_mrfs();
+hipError_t ihipStreamSynchronize_mrfs(hipStream_t stream);
+hipError_t ihipSetProcessQuota_mrfs(size_t quota);
 
 }  // namespace hip

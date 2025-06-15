@@ -370,8 +370,11 @@ hipError_t hipStreamSynchronize_common(hipStream_t stream) {
 // ================================================================================================
 hipError_t hipStreamSynchronize(hipStream_t stream) {
   HIP_INIT_API(hipStreamSynchronize, stream);
-  // HIP_RETURN(hipStreamSynchronize_common(stream));
-  HIP_RETURN(interceptedHipStreamSynchronize(stream));
+#ifdef MRFS
+  HIP_RETURN(ihipStreamSynchronize_mrfs(stream));
+#else
+  HIP_RETURN(hipStreamSynchronize_common(stream));
+#endif
 }
 
 // ================================================================================================

@@ -1566,8 +1566,20 @@ hipError_t hipMemcpyAsync_common(void* dst, const void* src, size_t sizeBytes,
   if (!hip::isValid(stream)) {
     return hipErrorContextIsDestroyed;
   }
-  // return ihipMemcpy(dst, src, sizeBytes, kind, *hip_stream, true);
-  return hipMemcpyAsync_mrfs(dst, src, sizeBytes, kind, *hip_stream);
+#ifdef MRFS
+  return ihipMemcpyAsync_mrfs(dst, src, sizeBytes, kind, stream);
+#else
+  return ihipMemcpy(dst, src, sizeBytes, kind, *hip_stream, true);
+#endif
+}
+
+hipError_t hipSetProcessQuota(size_t quota) {
+#ifdef MRFS
+  HIP_INIT_API(hipSetProcessQuota, quota);
+  HIP_RETURN_DURATION(ihipSetProcessQuota_mrfs(quota));
+#else
+  return hipSuccess;
+#endif
 }
 
 hipError_t hipMemcpyAsync(void* dst, const void* src, size_t sizeBytes,
