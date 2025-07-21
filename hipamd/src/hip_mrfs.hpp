@@ -3,13 +3,20 @@
 #include <hip/hip_runtime.h>
 #include <chrono>
 #include <thread>
+#include <errno.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include "hip_internal.hpp"
 
 namespace hip {
+#define MRFS
+
 #define MRFS_MIN_CHUNK_SIZE 4096
 #define MRFS_M_CHANCE 4
-#define MRFS_TASK_QUEUE_SIZE (1024)  // TODO: Fine tune this!
-#define MRFS_REALLOCATE_PERIOD_NS (10000000) // Every 10 ms
+#define MRFS_TASK_QUEUE_SIZE (1024)           // TODO: Fine tune this!
+#define MRFS_REALLOCATE_PERIOD_NS (10000000)  // Every 10 ms
+
+#define MRFS_SERVER_SOCKET_PATH "/tmp/mrfs.sock"
 
 static uint64_t getCurrentTime() {
   struct timespec ts;
@@ -41,14 +48,12 @@ class TaskBuffer {
   int capacity_;
 
  public:
-
-  TaskBuffer(): head_(0), tail_(0), count_(0), capacity_(MRFS_TASK_QUEUE_SIZE) {}
+  TaskBuffer() : head_(0), tail_(0), count_(0), capacity_(MRFS_TASK_QUEUE_SIZE) {}
 
   bool push_back(std::unique_ptr<MemcpyTask> task) {
     std::lock_guard<std::mutex> lock(mutex_);
 
-    if (count_ == capacity_)
-      return false;
+    if (count_ == capacity_) return false;
 
     buffer_[tail_] = std::move(task);
     tail_ = (tail_ + 1) % capacity_;
@@ -102,6 +107,10 @@ class QuotaManager {
   void workerFunction(int deviceId);
   void reallocatedeviceQuotaBPW();
 
+  int sock;
+  struct sockaddr_un addr;
+  struct sockaddr_un server_addr;
+
  protected:
   QuotaManager() {
     hipError_t _ = hipGetDeviceCount(&deviceCount);
@@ -117,6 +126,19 @@ class QuotaManager {
       workers[i] = std::thread(&QuotaManager::workerFunction, this, i);
     }
     quotaManager = std::thread(&QuotaManager::reallocatedeviceQuotaBPW, this);
+
+    int err = 0;
+    sock = socket(AF_UNIX, SOCK_DGRAM, 0);
+    addr = {.sun_family = AF_UNIX};
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "/tmp/mrfs_%d.sock", getpid());
+    unlink(addr.sun_path);
+    err = bind(sock, (struct sockaddr*)&addr, sizeof(addr));
+    if (err) {
+      fprintf(stderr, "failed to bind the socket: %s\n", addr.sun_path);
+      exit(err);
+    }
+    server_addr = {.sun_family = AF_UNIX};
+    strcpy(server_addr.sun_path, MRFS_SERVER_SOCKET_PATH);
   }
 
  public:
@@ -134,7 +156,7 @@ class QuotaManager {
 };
 
 hipError_t ihipMemcpyAsync_mrfs(void* dst, const void* src, size_t sizeBytes, hipMemcpyKind kind,
-                               hipStream_t stream);
+                                hipStream_t stream);
 void ihipDeviceSynchronize_mrfs();
 hipError_t ihipStreamSynchronize_mrfs(hipStream_t stream);
 hipError_t ihipSetProcessQuota_mrfs(size_t quota);

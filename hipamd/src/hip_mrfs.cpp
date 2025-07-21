@@ -16,11 +16,10 @@ void QuotaManager::workerFunction(int deviceId) {
   uint64_t endTime = 0;
   size_t chunkSize = MRFS_MIN_CHUNK_SIZE << 10;
 
-
   while (true) {
     auto task = buffers[deviceId]->get_front();
     size_t remainingBytes = task->sizeBytes;
-    while(remainingBytes > 0) {
+    while (remainingBytes > 0) {
       startTime = getCurrentTime();
 
       size_t quotaBPS = deviceQuotaBPS[deviceId]->load(std::memory_order_relaxed);
@@ -36,10 +35,9 @@ void QuotaManager::workerFunction(int deviceId) {
       size_t usedBPS = (sizeBytes * 1000000000) / (endTime - startTime);
 
       if (usedBPS < ((9 * quotaBPS) / 10)) {
-        chunkSize += (chunkSize >> 1); // Multiply by 1.5 -> Going up slowly!
-      }
-      else if (usedBPS > ((11 * quotaBPS) / 10) && chunkSize > MRFS_MIN_CHUNK_SIZE) {
-        chunkSize >>= 1; // Divide by 2 -> Coming back down fast!
+        chunkSize += (chunkSize >> 1);  // Multiply by 1.5 -> Going up slowly!
+      } else if (usedBPS > ((11 * quotaBPS) / 10) && chunkSize > MRFS_MIN_CHUNK_SIZE) {
+        chunkSize >>= 1;  // Divide by 2 -> Coming back down fast!
       }
       remainingBytes -= sizeBytes;
     }
@@ -54,10 +52,25 @@ void QuotaManager::reallocatedeviceQuotaBPW() {
   int activeDeviceCount = 0;
   std::cerr << "Quota reallocator started" << std::endl;
 
-  while(true) {
-    bool flag = false;
-    size_t newQuotaBPS = processQuotaBPS.load(std::memory_order_relaxed);
+  pid_t client_pid = getpid();
+  while (true) {
+    size_t newQuotaBPS = currentQuotaBPS;
+    ssize_t sent = sendto(sock, &client_pid, sizeof(pid_t), 0, (struct sockaddr*)&server_addr,
+                          strlen(server_addr.sun_path) + sizeof(server_addr.sun_family));
+    if (sent == -1) {
+      std::cout << "Failed to sent heartbeat msg to the socket server " << errno << std::endl;
+    } else {
+      std::cout << "Sent heartbeat msg to the socket server: " << server_addr.sun_path << std::endl;
+    }
+    ssize_t recvd = recvfrom(sock, &newQuotaBPS, sizeof(newQuotaBPS), 0, NULL, NULL);
+    if (recvd == -1) {
+      std::cout << "Failed to recevie bandwidth from the socket server " << errno << std::endl;
+    } else {
+      std::cout << "Recevied bandwidth " << newQuotaBPS
+                << " from the socket server: " << server_addr.sun_path << std::endl;
+    }
 
+    bool flag = false;
     // Check if there is new quota
     if (currentQuotaBPS != newQuotaBPS) {
       currentQuotaBPS = newQuotaBPS;
@@ -69,15 +82,14 @@ void QuotaManager::reallocatedeviceQuotaBPW() {
       if (buffers[i]->size() != 0) {
         if (activeDevices[i] == 0) {
           activeDeviceCount++;
-	  flag = true;
-	}
+          flag = true;
+        }
         activeDevices[i] = MRFS_M_CHANCE;
-      }
-      else {
+      } else {
         if (activeDevices[i] == 1) {
           activeDeviceCount--;
           flag = true;
-	}
+        }
         if (activeDevices[i] > 0) {
           activeDevices[i]--;
         }
@@ -115,9 +127,7 @@ bool QuotaManager::addTask(void* dst, const void* src, size_t sizeBytes, hipMemc
   return buffers[deviceId]->push_back(std::move(task));
 }
 
-void QuotaManager::waitForDevice(int deviceId) {
-  buffers[deviceId]->wait_till_empty();
-}
+void QuotaManager::waitForDevice(int deviceId) { buffers[deviceId]->wait_till_empty(); }
 
 hipError_t ihipMemcpyAsync_mrfs(void* dst, const void* src, size_t sizeBytes, hipMemcpyKind kind,
                                 hipStream_t stream) {
@@ -136,10 +146,11 @@ hipError_t ihipMemcpyAsync_mrfs(void* dst, const void* src, size_t sizeBytes, hi
 
   int deviceId = getCurrentDevice()->deviceId();
 
-  if (QuotaManager::getInstance().addTask(dst, src, sizeBytes, kind, stream, deviceId))
+  if (QuotaManager::getInstance().addTask(dst, src, sizeBytes, kind, stream, deviceId)) {
     return hipSuccess;
-  else
-    return hipErrorOutOfMemory; //TODO: Find or define a better error code
+  } else {
+    return hipErrorOutOfMemory;  // TODO: Find or define a better error code
+  }
 }
 
 void ihipDeviceSynchronize_mrfs() {
