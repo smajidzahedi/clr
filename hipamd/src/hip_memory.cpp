@@ -1567,7 +1567,12 @@ hipError_t hipMemcpyAsync_common(void* dst, const void* src, size_t sizeBytes,
     return hipErrorContextIsDestroyed;
   }
 #ifdef MRFS
-  return ihipMemcpyAsync_mrfs(dst, src, sizeBytes, kind, stream);
+  if (kind == hipMemcpyHostToDevice || kind == hipMemcpyDeviceToHost) {
+    return ihipMemcpyAsync_mrfs(dst, src, sizeBytes, kind, stream);
+  }
+  else {
+    return ihipMemcpy(dst, src, sizeBytes, kind, *hip_stream, true);
+  }
 #else
   return ihipMemcpy(dst, src, sizeBytes, kind, *hip_stream, true);
 #endif

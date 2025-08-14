@@ -11,7 +11,7 @@ extern hipError_t ihipMemcpy_validate(void* dst, const void* src, size_t sizeByt
 
 void QuotaManager::workerFunction(int deviceId) {
   amd::Thread::init();
-  std::cerr << "Worker " << deviceId << " started" << std::endl;
+  std::cerr << "LOG: Worker " << deviceId << " started" << std::endl;
   uint64_t startTime = 0;
   uint64_t endTime = 0;
   size_t chunkSize = MRFS_MIN_CHUNK_SIZE << 10;
@@ -19,11 +19,13 @@ void QuotaManager::workerFunction(int deviceId) {
 
   while (true) {
     auto task = buffers[deviceId]->get_front();
+    int numaId = task->numaId;
     size_t remainingBytes = task->sizeBytes;
+
     while(remainingBytes > 0) {
       startTime = getCurrentTime();
 
-      size_t quotaBPS = deviceQuotaBPS[deviceId]->load(std::memory_order_relaxed);
+      size_t quotaBPS = deviceNumaQuotaBPS[numaId][deviceId].load(std::memory_order_relaxed);
 
       size_t sizeBytes = std::min(chunkSize, remainingBytes);
       void* dst = static_cast<char*>(task->dst) + (task->sizeBytes - remainingBytes);
@@ -38,73 +40,105 @@ void QuotaManager::workerFunction(int deviceId) {
       if (usedBPS < ((9 * quotaBPS) / 10)) {
         chunkSize += (chunkSize >> 1); // Multiply by 1.5 -> Going up slowly!
       }
-      else if (usedBPS > ((11 * quotaBPS) / 10) && chunkSize > MRFS_MIN_CHUNK_SIZE) {
+      else if (usedBPS > ((11 * quotaBPS) / 10) && chunkSize > 2 * MRFS_MIN_CHUNK_SIZE) {
         chunkSize >>= 1; // Divide by 2 -> Coming back down fast!
       }
       remainingBytes -= sizeBytes;
     }
 
-    buffers[deviceId]->pop_front();
+    buffers[deviceId]->pop_front(numaId);
   }
 }
 
-void QuotaManager::reallocatedeviceQuotaBPW() {
-  size_t currentQuotaBPS = 0;
-  std::vector<int> activeDevices(deviceCount, 0);
-  int activeDeviceCount = 0;
-  std::cerr << "Quota reallocator started" << std::endl;
+void QuotaManager::reallocateDeviceNumaQuotaBPW() {
+  std::vector<size_t> currentQuotaBPS(numaCount, 0);
+  std::vector<std::vector<int>> activeDevices(numaCount, std::vector<int>(deviceCount, 0));
+  std::vector<int> activeDeviceCount(numaCount, 0);
+  std::cerr << "LOG: Quota re-allocator started" << std::endl;
 
   while(true) {
-    bool flag = false;
-    size_t newQuotaBPS = processQuotaBPS.load(std::memory_order_relaxed);
+    for (int node = 0; node < numaCount; node++) {
+      bool flag = false;
+      size_t newQuotaBPS = processNumaQuotaBPS[node].load(std::memory_order_relaxed);
 
-    // Check if there is new quota
-    if (currentQuotaBPS != newQuotaBPS) {
-      currentQuotaBPS = newQuotaBPS;
-      flag = true;
-    }
-
-    // Check if devices have become inactive or active
-    for (int i = 0; i < deviceCount; i++) {
-      if (buffers[i]->size() != 0) {
-        if (activeDevices[i] == 0) {
-          activeDeviceCount++;
-	  flag = true;
-	}
-        activeDevices[i] = MRFS_M_CHANCE;
+      // Check if there is new quota
+      if (currentQuotaBPS[node] != newQuotaBPS) {
+        currentQuotaBPS[node] = newQuotaBPS;
+        flag = true;
       }
-      else {
-        if (activeDevices[i] == 1) {
-          activeDeviceCount--;
-          flag = true;
-	}
-        if (activeDevices[i] > 0) {
-          activeDevices[i]--;
-        }
-      }
-    }
 
-    if (flag) {
+      // Check if devices have become inactive or active
       for (int i = 0; i < deviceCount; i++) {
-        if (activeDevices[i] > 0) {
-          size_t quotaPerDeviceBPS = currentQuotaBPS / activeDeviceCount;
-          deviceQuotaBPS[i]->store(quotaPerDeviceBPS, std::memory_order_relaxed);
+        if (buffers[i]->size(node) != 0) {
+          if (activeDevices[node][i] == 0) {
+            activeDeviceCount[node]++;
+            flag = true;
+          }
+          activeDevices[node][i] = MRFS_M_CHANCE;
         } else {
-          deviceQuotaBPS[i]->store(0, std::memory_order_relaxed);
+          if (activeDevices[node][i] == 1) {
+            activeDeviceCount[node]--;
+            flag = true;
+          }
+          if (activeDevices[node][i] > 0) {
+            activeDevices[node][i]--;
+          }
+        }
+      }
+
+      if (flag) {
+        for (int i = 0; i < deviceCount; i++) {
+          if (activeDevices[node][i] > 0) {
+            size_t quotaPerDeviceBPS = currentQuotaBPS[node] / activeDeviceCount[node];
+            deviceNumaQuotaBPS[node][i].store(quotaPerDeviceBPS, std::memory_order_relaxed);
+          } else {
+            deviceNumaQuotaBPS[node][i].store(0, std::memory_order_relaxed);
+          }
         }
       }
     }
-
     std::this_thread::sleep_for(std::chrono::nanoseconds(MRFS_REALLOCATE_PERIOD_NS));
   }
 }
 
+void QuotaManager::setProcessNumaQuota(size_t newQuotaBPS, int numaId) {
+  processNumaQuotaBPS[numaId].store(newQuotaBPS, std::memory_order_relaxed);
+}
+
 void QuotaManager::setProcessQuota(size_t newQuotaBPS) {
-  processQuotaBPS.store(newQuotaBPS, std::memory_order_relaxed);
+  for (int i = 0; i < numaCount; i++) {
+    setProcessNumaQuota(newQuotaBPS, i);
+  }
 }
 
 bool QuotaManager::addTask(void* dst, const void* src, size_t sizeBytes, hipMemcpyKind kind,
                            hipStream_t stream, int deviceId) {
+
+  void *ptr_1, *ptr_2;
+  switch (kind) {
+    case hipMemcpyHostToDevice:
+      ptr_1 = const_cast<void *>(src);
+      ptr_2 = dst;
+      break;
+    case hipMemcpyDeviceToHost:
+      ptr_1 = dst;
+      ptr_2 = const_cast<void *>(src);
+      break;
+    default:
+      return false; // TODO: we currently only support H2D and D2H
+  }
+
+  int numa_node = -1;
+  get_mempolicy(&numa_node, NULL, 0, ptr_1, MPOL_F_NODE | MPOL_F_ADDR);
+
+  if (numa_node < 0 || numa_node > numaCount) {
+    get_mempolicy(&numa_node, NULL, 0, ptr_2, MPOL_F_NODE | MPOL_F_ADDR);
+    if (numa_node < 0 || numa_node > numaCount) {
+      std::cerr << "ERR: could not find numa node for src and des" << std::endl;
+      return false;
+    }
+  }
+
   std::unique_ptr task = std::make_unique<MemcpyTask>();
   task->dst = dst;
   task->src = src;
@@ -112,6 +146,8 @@ bool QuotaManager::addTask(void* dst, const void* src, size_t sizeBytes, hipMemc
   task->kind = kind;
   task->stream = stream;
   task->deviceId = deviceId;
+  task->numaId = numa_node;
+  std::atomic_thread_fence(std::memory_order_release);
   return buffers[deviceId]->push_back(std::move(task));
 }
 
@@ -136,10 +172,11 @@ hipError_t ihipMemcpyAsync_mrfs(void* dst, const void* src, size_t sizeBytes, hi
 
   int deviceId = getCurrentDevice()->deviceId();
 
-  if (QuotaManager::getInstance().addTask(dst, src, sizeBytes, kind, stream, deviceId))
+  if (QuotaManager::getInstance().addTask(dst, src, sizeBytes, kind, stream, deviceId)) {
     return hipSuccess;
-  else
-    return hipErrorOutOfMemory; //TODO: Find or define a better error code
+  } else {
+    return hipErrorTbd;  // TODO: Find or define a better error code
+  }
 }
 
 void ihipDeviceSynchronize_mrfs() {

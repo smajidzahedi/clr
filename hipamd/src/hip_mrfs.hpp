@@ -4,11 +4,14 @@
 #include <chrono>
 #include <thread>
 #include "hip_internal.hpp"
+#include <numa.h>
+#include <numaif.h>
+#include <atomic>
 
 namespace hip {
 #define MRFS_MIN_CHUNK_SIZE 4096
 #define MRFS_M_CHANCE 4
-#define MRFS_TASK_QUEUE_SIZE (1024)  // TODO: Fine tune this!
+#define MRFS_TASK_QUEUE_SIZE (128)  // TODO: Fine tune this!
 #define MRFS_REALLOCATE_PERIOD_NS (10000000) // Every 10 ms
 
 static uint64_t getCurrentTime() {
@@ -25,6 +28,7 @@ struct MemcpyTask {
   hipMemcpyKind kind;
   hipStream_t stream;
   int deviceId;
+  int numaId;
 };
 
 class TaskBuffer {
@@ -38,31 +42,42 @@ class TaskBuffer {
   int head_;
   int tail_;
   int count_;
+  int *count_per_numa_;
   int capacity_;
 
  public:
 
-  TaskBuffer(): head_(0), tail_(0), count_(0), capacity_(MRFS_TASK_QUEUE_SIZE) {}
+  TaskBuffer(int numaCount): head_(0), tail_(0), count_(0), capacity_(MRFS_TASK_QUEUE_SIZE) {
+    count_per_numa_ = new int[numaCount];
+    for (int i = 0; i < numaCount; i++) {
+      count_per_numa_[i] = 0;
+    }
+  }
+
+  ~TaskBuffer(){
+    delete [] count_per_numa_;
+  }
 
   bool push_back(std::unique_ptr<MemcpyTask> task) {
     std::lock_guard<std::mutex> lock(mutex_);
-
     if (count_ == capacity_)
       return false;
 
+    ++count_;
+    ++count_per_numa_[task->numaId];
+
     buffer_[tail_] = std::move(task);
     tail_ = (tail_ + 1) % capacity_;
-    ++count_;
-
     on_empty_.notify_one();
     return true;
   }
 
-  void pop_front() {
+  void pop_front(int numaId) {
     std::unique_lock<std::mutex> lock(mutex_);
     on_empty_.wait(lock, [this]() { return count_ > 0; });
     head_ = (head_ + 1) % capacity_;
     --count_;
+    --count_per_numa_[numaId];
     if (count_ == 0) {
       on_not_empty_.notify_all();
     }
@@ -76,6 +91,10 @@ class TaskBuffer {
     return task;
   }
 
+  int size(int numaId) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return count_per_numa_[numaId];
+  }
 
   int size() const {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -91,32 +110,58 @@ class TaskBuffer {
 class QuotaManager {
  private:
   int deviceCount;
-  std::atomic<size_t> processQuotaBPS;
+  int numaCount;
+  std::atomic<size_t> *processNumaQuotaBPS;
   long pageSize;
 
-  std::vector<std::unique_ptr<std::atomic<size_t>>> deviceQuotaBPS;
-  std::vector<std::unique_ptr<TaskBuffer>> buffers;
+  std::atomic<size_t> **deviceNumaQuotaBPS;
+  TaskBuffer **buffers;
 
   std::vector<std::thread> workers;
   std::thread quotaManager;
   void workerFunction(int deviceId);
-  void reallocatedeviceQuotaBPW();
+  void reallocateDeviceNumaQuotaBPW();
 
  protected:
   QuotaManager() {
     hipError_t _ = hipGetDeviceCount(&deviceCount);
-    processQuotaBPS.store(deviceCount * 8ULL * 1024 * 1024 * 1024, std::memory_order_relaxed);
 
-    deviceQuotaBPS.reserve(deviceCount);
-    buffers.reserve(deviceCount);
+    if (numa_available() < 0) {
+      numaCount = 1;
+    } else {
+      numaCount = numa_max_node() + 1;
+    }
 
+    processNumaQuotaBPS = new std::atomic<size_t>[numaCount];
+    deviceNumaQuotaBPS = new std::atomic<size_t>*[numaCount];
+
+    for (int i = 0; i < numaCount; i++) {
+      processNumaQuotaBPS[i].store(deviceCount * 8ULL * 1024 * 1024 * 1024, std::memory_order_relaxed);
+      deviceNumaQuotaBPS[i] = new std::atomic<size_t>[deviceCount];
+      for (int j = 0; j < deviceCount; j++) {
+        deviceNumaQuotaBPS[i][j].store(8ULL * 1024 * 1024 * 1024, std::memory_order_relaxed);
+      }
+    }
+
+    buffers = new TaskBuffer*[deviceCount];
     workers.resize(deviceCount);
     for (int i = 0; i < deviceCount; i++) {
-      deviceQuotaBPS.emplace_back(std::make_unique<std::atomic<size_t>>(8ULL * 1024 * 1024 * 1024));
-      buffers.emplace_back(std::make_unique<TaskBuffer>());
+      buffers[i] = new TaskBuffer(numaCount);
       workers[i] = std::thread(&QuotaManager::workerFunction, this, i);
     }
-    quotaManager = std::thread(&QuotaManager::reallocatedeviceQuotaBPW, this);
+    quotaManager = std::thread(&QuotaManager::reallocateDeviceNumaQuotaBPW, this);
+  }
+
+  ~QuotaManager() {
+    delete [] processNumaQuotaBPS;
+    for (int i = 0; i < numaCount; i++) {
+      delete [] deviceNumaQuotaBPS[i];
+    }
+    delete [] deviceNumaQuotaBPS;
+    for (int i = 0; i < deviceCount; i++) {
+      delete buffers[i];
+    }
+    delete [] buffers;
   }
 
  public:
@@ -127,7 +172,8 @@ class QuotaManager {
     return instance;
   }
 
-  void setProcessQuota(size_t quota);
+  void setProcessQuota(size_t quota); // Sets the same quota for all numa nodes
+  void setProcessNumaQuota(size_t quota, int numaId);
   bool addTask(void* dst, const void* src, size_t sizeBytes, hipMemcpyKind kind, hipStream_t stream,
                int deviceId);
   void waitForDevice(int deviceId);
