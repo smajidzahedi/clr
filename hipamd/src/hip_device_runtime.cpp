@@ -21,6 +21,7 @@
 #include <hip/hip_runtime.h>
 
 #include "hip_internal.hpp"
+#include "hip_mrfs.hpp"
 
 #undef hipChooseDevice
 #undef hipDeviceProp_t
@@ -640,8 +641,12 @@ hipError_t hipDeviceGetTexture1DLinearMaxWidth(size_t* maxWidthInElements,
 hipError_t hipDeviceSynchronize() {
   HIP_INIT_API(hipDeviceSynchronize);
   CHECK_SUPPORTED_DURING_CAPTURE();
+#ifdef MRFS
+  ihipDeviceSynchronize_mrfs();
+#else
   constexpr bool kDoWaitForCpu = false;
   hip::getCurrentDevice()->SyncAllStreams(kDoWaitForCpu);
+#endif
   HIP_RETURN(hipSuccess);
 }
 

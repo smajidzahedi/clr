@@ -464,6 +464,7 @@ hipError_t hipMemcpy2DToArrayAsync(hipArray_t dst, size_t wOffset, size_t hOffse
                                    hipStream_t stream);
 hipError_t hipMemcpy3D(const struct hipMemcpy3DParms* p);
 hipError_t hipMemcpy3DAsync(const struct hipMemcpy3DParms* p, hipStream_t stream);
+hipError_t hipSetProcessQuota(size_t quota);
 hipError_t hipMemcpyAsync(void* dst, const void* src, size_t sizeBytes, hipMemcpyKind kind,
                           hipStream_t stream);
 hipError_t hipMemcpyAtoH(void* dst, hipArray_t srcArray, size_t srcOffset, size_t count);
@@ -1277,6 +1278,7 @@ void UpdateDispatchTable(HipDispatchTable* ptrDispatchTable) {
   ptrDispatchTable->hipMemset2DAsync_spt_fn = hip::hipMemset2DAsync_spt;
   ptrDispatchTable->hipMemset3DAsync_spt_fn = hip::hipMemset3DAsync_spt;
   ptrDispatchTable->hipMemset3D_spt_fn = hip::hipMemset3D_spt;
+  ptrDispatchTable->hipSetProcessQuota_fn = hip::hipSetProcessQuota;
   ptrDispatchTable->hipMemcpyAsync_spt_fn = hip::hipMemcpyAsync_spt;
   ptrDispatchTable->hipMemcpy3DAsync_spt_fn = hip::hipMemcpy3DAsync_spt;
   ptrDispatchTable->hipMemcpy2DAsync_spt_fn = hip::hipMemcpy2DAsync_spt;
@@ -1951,19 +1953,21 @@ HIP_ENFORCE_ABI(HipDispatchTable, hipGraphAddBatchMemOpNode_fn, 464);
 HIP_ENFORCE_ABI(HipDispatchTable, hipGraphBatchMemOpNodeGetParams_fn, 465);
 HIP_ENFORCE_ABI(HipDispatchTable, hipGraphBatchMemOpNodeSetParams_fn, 466);
 HIP_ENFORCE_ABI(HipDispatchTable, hipGraphExecBatchMemOpNodeSetParams_fn, 467);
-// HIP_RUNTIME_API_TABLE_STEP_VERSION == 8
+// HIP_RUNTIME_API_TABLE_STEP_VERSION == 9
 HIP_ENFORCE_ABI(HipDispatchTable, hipLinkAddData_fn , 468)
 HIP_ENFORCE_ABI(HipDispatchTable, hipLinkAddFile_fn , 469)
 HIP_ENFORCE_ABI(HipDispatchTable, hipLinkComplete_fn , 470)
 HIP_ENFORCE_ABI(HipDispatchTable, hipLinkCreate_fn , 471)
 HIP_ENFORCE_ABI(HipDispatchTable, hipLinkDestroy_fn , 472)
+// HIP_RUNTIME_API_TABLE_STEP_VERSION == 10
+HIP_ENFORCE_ABI(HipDispatchTable, hipSetProcessQuota_fn, 473)
 // if HIP_ENFORCE_ABI entries are added for each new function pointer in the table, the number below
 // will be +1 of the number in the last HIP_ENFORCE_ABI line. E.g.:
 //
 //  HIP_ENFORCE_ABI(<table>, <functor>, 8)
 //
-//  HIP_ENFORCE_ABI_VERSIONING(<table>, 9) <- 8 + 1 = 9
-HIP_ENFORCE_ABI_VERSIONING(HipDispatchTable, 473)
+//  HIP_ENFORCE_ABI_VERSIONING(<table>, 9) <- 9 + 1 = 10
+HIP_ENFORCE_ABI_VERSIONING(HipDispatchTable, 474)
 
 static_assert(HIP_RUNTIME_API_TABLE_MAJOR_VERSION == 0 && HIP_RUNTIME_API_TABLE_STEP_VERSION == 9,
               "If you get this error, add new HIP_ENFORCE_ABI(...) code for the new function "

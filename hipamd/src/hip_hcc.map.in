@@ -102,6 +102,7 @@ global:
     hipMemcpy3DAsync;
     hipDrvMemcpy3D;
     hipDrvMemcpy3DAsync;
+    hipSetProcessQuota;
     hipMemcpyAsync;
     hipMemcpyDtoD;
     hipMemcpyDtoDAsync;

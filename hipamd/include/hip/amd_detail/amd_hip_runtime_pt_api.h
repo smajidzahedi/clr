@@ -46,6 +46,7 @@ THE SOFTWARE.
     #define hipMemset                     __HIP_API_SPT(hipMemset)
     #define hipMemset2D                   __HIP_API_SPT(hipMemset2D)
     #define hipMemset3D                   __HIP_API_SPT(hipMemset3D)
+    #define hipSetProcessQuota            __HIP_API_SPT(hipSetProcessQuota)
     #define hipMemcpyAsync                __HIP_API_SPT(hipMemcpyAsync)
     #define hipMemset3DAsync              __HIP_API_SPT(hipMemset3DAsync)
     #define hipMemset2DAsync              __HIP_API_SPT(hipMemset2DAsync)

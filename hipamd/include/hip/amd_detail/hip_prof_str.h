@@ -436,7 +436,8 @@ enum hip_api_id_t {
   HIP_API_ID_hipLinkCreate = 416,
   HIP_API_ID_hipLinkDestroy = 417,
   HIP_API_ID_hipEventRecordWithFlags = 418,
-  HIP_API_ID_LAST = 418,
+  HIP_API_ID_hipSetProcessQuota = 419,
+  HIP_API_ID_LAST = 419,
 
   HIP_API_ID_hipChooseDevice = HIP_API_ID_CONCAT(HIP_API_ID_,hipChooseDevice),
   HIP_API_ID_hipGetDeviceProperties = HIP_API_ID_CONCAT(HIP_API_ID_,hipGetDeviceProperties),
@@ -763,6 +764,7 @@ static inline const char* hip_api_name(const uint32_t id) {
     case HIP_API_ID_hipMemcpy2DToArrayAsync: return "hipMemcpy2DToArrayAsync";
     case HIP_API_ID_hipMemcpy3D: return "hipMemcpy3D";
     case HIP_API_ID_hipMemcpy3DAsync: return "hipMemcpy3DAsync";
+    case HIP_API_ID_hipSetProcessQuota: return "hipSetProcessQuota";
     case HIP_API_ID_hipMemcpyAsync: return "hipMemcpyAsync";
     case HIP_API_ID_hipMemcpyAtoA: return "hipMemcpyAtoA";
     case HIP_API_ID_hipMemcpyAtoD: return "hipMemcpyAtoD";
@@ -1176,6 +1178,7 @@ static inline uint32_t hipApiIdByName(const char* name) {
   if (strcmp("hipMemcpy2DToArrayAsync", name) == 0) return HIP_API_ID_hipMemcpy2DToArrayAsync;
   if (strcmp("hipMemcpy3D", name) == 0) return HIP_API_ID_hipMemcpy3D;
   if (strcmp("hipMemcpy3DAsync", name) == 0) return HIP_API_ID_hipMemcpy3DAsync;
+  if (strcmp("hipSetProcessQuota", name) == 0) return HIP_API_ID_hipSetProcessQuota;
   if (strcmp("hipMemcpyAsync", name) == 0) return HIP_API_ID_hipMemcpyAsync;
   if (strcmp("hipMemcpyAtoA", name) == 0) return HIP_API_ID_hipMemcpyAtoA;
   if (strcmp("hipMemcpyAtoD", name) == 0) return HIP_API_ID_hipMemcpyAtoD;
@@ -3011,6 +3014,9 @@ typedef struct hip_api_data_s {
       hipMemcpy3DParms p__val;
       hipStream_t stream;
     } hipMemcpy3DAsync;
+    struct {
+      size_t quota;
+    } hipSetProcessQuota;
     struct {
       void* dst;
       const void* src;
@@ -5449,6 +5455,10 @@ typedef struct hip_api_data_s {
 #define INIT_hipMemcpy3DAsync_CB_ARGS_DATA(cb_data) { \
   cb_data.args.hipMemcpy3DAsync.p = (const hipMemcpy3DParms*)p; \
   cb_data.args.hipMemcpy3DAsync.stream = (hipStream_t)stream; \
+};
+// hipSetProcessQuota[('size_t', 'quota')]
+#define INIT_hipSetProcessQuota_CB_ARGS_DATA(cb_data) { \
+  cb_data.args.hipSetProcessQuota.quota = (size_t)quota; \
 };
 // hipMemcpyAsync[('void*', 'dst'), ('const void*', 'src'), ('size_t', 'sizeBytes'), ('hipMemcpyKind', 'kind'), ('hipStream_t', 'stream')]
 #define INIT_hipMemcpyAsync_CB_ARGS_DATA(cb_data) { \
@@ -10163,6 +10173,11 @@ static inline const char* hipApiString(hip_api_id_t id, const hip_api_data_t* da
       if (data->args.hipMemcpy3DAsync.p == NULL) oss << "p=NULL";
       else { oss << "p="; roctracer::hip_support::detail::operator<<(oss, data->args.hipMemcpy3DAsync.p__val); }
       oss << ", stream="; roctracer::hip_support::detail::operator<<(oss, data->args.hipMemcpy3DAsync.stream);
+      oss << ")";
+    break;
+    case HIP_API_ID_hipSetProcessQuota:
+      oss << "hipSetProcessQuota(";
+      oss << "quota="; roctracer::hip_support::detail::operator<<(oss, data->args.hipSetProcessQuota.quota);
       oss << ")";
     break;
     case HIP_API_ID_hipMemcpyAsync:

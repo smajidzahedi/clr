@@ -1086,6 +1086,9 @@ hipError_t hipMemcpy3D(const struct hipMemcpy3DParms* p) {
 hipError_t hipMemcpy3DAsync(const struct hipMemcpy3DParms* p, hipStream_t stream) {
   return hip::GetHipDispatchTable()->hipMemcpy3DAsync_fn(p, stream);
 }
+hipError_t hipSetProcessQuota(size_t quota) {
+  return hip::GetHipDispatchTable()->hipSetProcessQuota_fn(quota);
+}
 hipError_t hipMemcpyAsync(void* dst, const void* src, size_t sizeBytes, hipMemcpyKind kind,
                           hipStream_t stream) {
   return hip::GetHipDispatchTable()->hipMemcpyAsync_fn(dst, src, sizeBytes, kind, stream);

@@ -24,6 +24,7 @@
 #include "thread/monitor.hpp"
 #include "hip_prof_api.h"
 #include <atomic>
+#include "hip_mrfs.hpp"
 
 namespace hip {
 
@@ -380,7 +381,11 @@ hipError_t hipStreamSynchronize_common(hipStream_t stream) {
 // ================================================================================================
 hipError_t hipStreamSynchronize(hipStream_t stream) {
   HIP_INIT_API(hipStreamSynchronize, stream);
+#ifdef MRFS
+  HIP_RETURN(ihipStreamSynchronize_mrfs(stream));
+#else
   HIP_RETURN(hipStreamSynchronize_common(stream));
+#endif
 }
 
 // ================================================================================================

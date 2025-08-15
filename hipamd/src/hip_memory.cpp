@@ -26,6 +26,7 @@
 #include "platform/command.hpp"
 #include "platform/memory.hpp"
 #include "platform/external_memory.hpp"
+#include "hip_mrfs.hpp"
 namespace hip {
 
 // Guards global hipArray set
@@ -1436,7 +1437,20 @@ hipError_t hipMemcpyAsync_common(void* dst, const void* src, size_t sizeBytes,
   if (!hip::isValid(stream)) {
     return hipErrorContextIsDestroyed;
   }
+#ifdef MRFS
+  return ihipMemcpyAsync_mrfs(dst, src, sizeBytes, kind, stream);
+#else
   return ihipMemcpy(dst, src, sizeBytes, kind, *hip_stream, true);
+#endif
+}
+
+hipError_t hipSetProcessQuota(size_t quota) {
+#ifdef MRFS
+  HIP_INIT_API(hipSetProcessQuota, quota);
+  HIP_RETURN_DURATION(ihipSetProcessQuota_mrfs(quota));
+#else
+  return hipSuccess;
+#endif
 }
 
 inline hipError_t ihipMemcpySymbol_validate(const void* symbol, size_t sizeBytes,
