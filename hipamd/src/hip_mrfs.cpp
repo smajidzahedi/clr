@@ -15,17 +15,30 @@ void QuotaManager::workerFunction(int deviceId) {
   uint64_t startTime = 0;
   uint64_t endTime = 0;
   size_t chunkSize = MRFS_MIN_CHUNK_SIZE << 10;
+  std::vector<int> currentActiveNumaDevices(numaCount, 1.0);
+  std::vector<int> mChance(numaCount, MRFS_M_CHANCE);
 
 
   while (true) {
     auto task = buffers[deviceId]->get_front();
     int numaId = task->numaId;
+    numaActiveDevices[numaId].fetch_add(1, std::memory_order_relaxed);
     size_t remainingBytes = task->sizeBytes;
 
     while(remainingBytes > 0) {
       startTime = getCurrentTime();
 
-      size_t quotaBPS = deviceNumaQuotaBPS[numaId][deviceId].load(std::memory_order_relaxed);
+      size_t numaQuotaBPS = processNumaQuotaBPS[numaId].load(std::memory_order_relaxed);
+      int numActiveNumaDevices = numaActiveDevices[numaId].load(std::memory_order_relaxed);
+      if (mChance[numaId] == 0) {
+        currentActiveNumaDevices[numaId] = numActiveNumaDevices;
+        mChance[numaId] = MRFS_M_CHANCE;
+      } else if (numActiveNumaDevices != currentActiveNumaDevices[numaId]) {
+        mChance[numaId]--;
+      } else {
+        mChance[numaId] = MRFS_M_CHANCE;
+      }
+      size_t quotaBPS = numaQuotaBPS / currentActiveNumaDevices[numaId];
 
       size_t sizeBytes = std::min(chunkSize, remainingBytes);
       void* dst = static_cast<char*>(task->dst) + (task->sizeBytes - remainingBytes);
@@ -39,65 +52,15 @@ void QuotaManager::workerFunction(int deviceId) {
 
       if (usedBPS < ((9 * quotaBPS) / 10)) {
         chunkSize += (chunkSize >> 1); // Multiply by 1.5 -> Going up slowly!
-      }
-      else if (usedBPS > ((11 * quotaBPS) / 10) && chunkSize > 2 * MRFS_MIN_CHUNK_SIZE) {
+      } else if (usedBPS > ((11 * quotaBPS) / 10) && chunkSize > 2 * MRFS_MIN_CHUNK_SIZE) {
         chunkSize >>= 1; // Divide by 2 -> Coming back down fast!
       }
+
       remainingBytes -= sizeBytes;
     }
 
     buffers[deviceId]->pop_front(numaId);
-  }
-}
-
-void QuotaManager::reallocateDeviceNumaQuotaBPW() {
-  std::vector<size_t> currentQuotaBPS(numaCount, 0);
-  std::vector<std::vector<int>> activeDevices(numaCount, std::vector<int>(deviceCount, 0));
-  std::vector<int> activeDeviceCount(numaCount, 0);
-  std::cerr << "LOG: Quota re-allocator started" << std::endl;
-
-  while(true) {
-    for (int node = 0; node < numaCount; node++) {
-      bool flag = false;
-      size_t newQuotaBPS = processNumaQuotaBPS[node].load(std::memory_order_relaxed);
-
-      // Check if there is new quota
-      if (currentQuotaBPS[node] != newQuotaBPS) {
-        currentQuotaBPS[node] = newQuotaBPS;
-        flag = true;
-      }
-
-      // Check if devices have become inactive or active
-      for (int i = 0; i < deviceCount; i++) {
-        if (buffers[i]->size(node) != 0) {
-          if (activeDevices[node][i] == 0) {
-            activeDeviceCount[node]++;
-            flag = true;
-          }
-          activeDevices[node][i] = MRFS_M_CHANCE;
-        } else {
-          if (activeDevices[node][i] == 1) {
-            activeDeviceCount[node]--;
-            flag = true;
-          }
-          if (activeDevices[node][i] > 0) {
-            activeDevices[node][i]--;
-          }
-        }
-      }
-
-      if (flag) {
-        for (int i = 0; i < deviceCount; i++) {
-          if (activeDevices[node][i] > 0) {
-            size_t quotaPerDeviceBPS = currentQuotaBPS[node] / activeDeviceCount[node];
-            deviceNumaQuotaBPS[node][i].store(quotaPerDeviceBPS, std::memory_order_relaxed);
-          } else {
-            deviceNumaQuotaBPS[node][i].store(0, std::memory_order_relaxed);
-          }
-        }
-      }
-    }
-    std::this_thread::sleep_for(std::chrono::nanoseconds(MRFS_REALLOCATE_PERIOD_NS));
+    numaActiveDevices[numaId].fetch_sub(1, std::memory_order_relaxed);
   }
 }
 

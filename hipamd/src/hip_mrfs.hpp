@@ -112,15 +112,11 @@ class QuotaManager {
   int deviceCount;
   int numaCount;
   std::atomic<size_t> *processNumaQuotaBPS;
-  long pageSize;
-
-  std::atomic<size_t> **deviceNumaQuotaBPS;
+  std::atomic<int> *numaActiveDevices;
   TaskBuffer **buffers;
 
   std::vector<std::thread> workers;
-  std::thread quotaManager;
   void workerFunction(int deviceId);
-  void reallocateDeviceNumaQuotaBPW();
 
  protected:
   QuotaManager() {
@@ -133,14 +129,11 @@ class QuotaManager {
     }
 
     processNumaQuotaBPS = new std::atomic<size_t>[numaCount];
-    deviceNumaQuotaBPS = new std::atomic<size_t>*[numaCount];
+    numaActiveDevices = new std::atomic<int>[numaCount];
 
     for (int i = 0; i < numaCount; i++) {
-      processNumaQuotaBPS[i].store(deviceCount * 8ULL * 1024 * 1024 * 1024, std::memory_order_relaxed);
-      deviceNumaQuotaBPS[i] = new std::atomic<size_t>[deviceCount];
-      for (int j = 0; j < deviceCount; j++) {
-        deviceNumaQuotaBPS[i][j].store(8ULL * 1024 * 1024 * 1024, std::memory_order_relaxed);
-      }
+      processNumaQuotaBPS[i].store(deviceCount * 8ULL * 1024 * 1024 * 1024);
+      numaActiveDevices[i].store(0);
     }
 
     buffers = new TaskBuffer*[deviceCount];
@@ -149,15 +142,11 @@ class QuotaManager {
       buffers[i] = new TaskBuffer(numaCount);
       workers[i] = std::thread(&QuotaManager::workerFunction, this, i);
     }
-    quotaManager = std::thread(&QuotaManager::reallocateDeviceNumaQuotaBPW, this);
   }
 
   ~QuotaManager() {
     delete [] processNumaQuotaBPS;
-    for (int i = 0; i < numaCount; i++) {
-      delete [] deviceNumaQuotaBPS[i];
-    }
-    delete [] deviceNumaQuotaBPS;
+    delete [] numaActiveDevices;
     for (int i = 0; i < deviceCount; i++) {
       delete buffers[i];
     }
